@@ -2,7 +2,6 @@
 /*
 Template Name: uhv_form
 */
-
 date_default_timezone_set('Asia/Kolkata');
 
 if (!defined('ABSPATH')) exit;
@@ -35,11 +34,14 @@ if (!$emp) {
 }
 
 // ========== ROLE DETERMINATION ==========
+// Aligned with LSSC/CATVAC: any logged-in employee may submit a TR; section flag gates staff (phase-1) form.
 $user_role = 'none';
 $funcdesg  = strtoupper(trim($emp->funcdesg ?? ''));
 $desgn     = strtoupper(trim($emp->desgn ?? ''));
 $section   = strtoupper(trim($emp->sectionfullname ?? ''));
 $division  = strtoupper(trim($emp->divisionfullname ?? ''));
+
+$is_uhv_section_person = (strpos($section, 'ULTRA HIGH VACCUM') !== false || strpos($division, 'LARGE SPACE') !== false);
 
 // ── QA ENGINEER: checked FIRST — anyone in the QA & T&E division
 if (strpos($division, 'QUALITY ASSURANCE AND TEST EVALUATION') !== false) {
@@ -61,24 +63,44 @@ if ($user_role === 'none') {
     }
 }
 
-// ── UHV STAFF (technicians in LARGE SPACE section)
+// ── UHV STAFF (technicians in LARGE SPACE section/division)
 if ($user_role === 'none') {
-    $is_uhv_sec  = strpos($section, 'LARGE SPACE') !== false || strpos($division, 'LARGE SPACE') !== false;
     $uhv_desgs   = ['TECHNICAL ASSISTANT','SR. TECHNICAL ASST.-A','SR. TECHNICAL ASST',
         'TECHNICIAN-F','TECHNICIAN-G','TECHNICIAN-D','TECHNICIAN-B','TECHNICIAN',
         'TECHNICAL OFFICER-C','TECHNICAL OFFICER-D','TECHNICAL OFFICER-E','TECHNICAL OFFICER',
         'ASSISTANT ENGINEER','JUNIOR ENGINEER'];
     $is_uhv_desg = false;
     foreach ($uhv_desgs as $d) { if (strpos($desgn, $d) !== false) { $is_uhv_desg = true; break; } }
-if ($is_uhv_sec && $is_uhv_desg) $user_role = 'UHV';
+    if ($is_uhv_section_person && $is_uhv_desg) {
+        $user_role = 'UHV';
+    }
+}
+
+// ── Any other employee: external / other-section submitter (LSSC-style tr_submitter)
+if ($user_role === 'none') {
+    $user_role = 'tr_submitter';
 }
 
 $GLOBALS['user_role'] = $user_role;
+$GLOBALS['is_uhv_section_person'] = $is_uhv_section_person;
+$GLOBALS['can_fill_staff_form'] = (
+    $user_role === 'UHV'
+    || $user_role === 'manager'
+    || (in_array($user_role, ['indenter', 'tr_submitter'], true) && $is_uhv_section_person)
+);
 
-if ($user_role === 'none') {
-    get_header();
-    echo "<div style='text-align:center;padding:60px;'><h2>Access Denied</h2><p>Your designation does not have access to this system.</p></div>";
-    get_footer(); exit;
+/** Roles that may create/save/submit the main UHV test request form (not only manager-specific flows). */
+function uhv_can_edit_test_request($role) {
+    return in_array($role, ['indenter', 'tr_submitter', 'manager', 'UHV'], true);
+}
+
+/** Empty string if blank or non-numeric; otherwise normalized number string (allows decimals). */
+function uhv_form_sanitize_opt_numeric($post_key) {
+    $v = isset($_POST[$post_key]) ? trim(wp_unslash((string) $_POST[$post_key])) : '';
+    if ($v === '' || !is_numeric($v)) {
+        return '';
+    }
+    return (string) (0 + (float) $v);
 }
 
 // ========== TABLE CREATION ==========
@@ -143,7 +165,10 @@ if (!$wpdb->get_var("SHOW TABLES LIKE '$table'")) {
         corona_test_json LONGTEXT,
         other_special_test_desc TEXT,
         bombing_leak_test_json LONGTEXT,
+        bombing_staff_json LONGTEXT,
         per_test_risk_json LONGTEXT,
+        test_code VARCHAR(100),
+        staff_review_date DATETIME,
         INDEX idx_test_requisition_no (test_requisition_no),
         INDEX idx_user_id (user_id),
         INDEX idx_status (status),
@@ -181,9 +206,9 @@ $new_cols = [
     'manager_decision_date' => 'DATETIME',
     'history_log'           => 'LONGTEXT NULL DEFAULT NULL',
     // --- Multipaction Test ---
-    'mp_package_name'       => 'TEXT',
     'mp_package_size'       => 'TEXT',
     'mp_test_profile_attach'=> 'VARCHAR(20)',
+    'mp_test_profile_file'  => 'TEXT',
     'mp_thermocouples'      => 'VARCHAR(50)',
     'mp_ft_rf_qty'          => 'INT DEFAULT 0',
     'mp_ft_elec_qty'        => 'INT DEFAULT 0',
@@ -204,6 +229,7 @@ $new_cols = [
     'tvc_start_cycle'       => 'VARCHAR(20)',
     'tvc_thermocouples'     => 'VARCHAR(50)',
     'tvc_instructions'      => 'TEXT',
+    'tvc_other_tests'       => 'TEXT',
     // --- VCM (Outgassing) Testing Material ---
     'vcm_samples_json'      => 'LONGTEXT',
     'vcm_vacuum_req'        => 'TEXT',
@@ -216,8 +242,29 @@ $new_cols = [
     'corona_test_json'      => 'LONGTEXT',
     'other_special_test_desc' => 'TEXT',
     'bombing_leak_test_json' => 'LONGTEXT',
-    'risk_record_uhv'      => "VARCHAR(20) DEFAULT ''",
-    'per_test_risk_json'   => 'LONGTEXT',
+    'bombing_staff_json'     => 'LONGTEXT',
+    'per_test_risk_json'     => 'LONGTEXT',
+    'risk_assessed_uhv'     => 'VARCHAR(50)',
+    'rpn_uhv'               => 'VARCHAR(50)',
+    'test_object_accepted'  => 'VARCHAR(50)',
+    'test_received_reviewed' => 'VARCHAR(50)',
+    'test_accepted_by'      => 'TEXT',
+    'risk_record_uhv'       => "VARCHAR(20) DEFAULT ''",
+    'staff_review_date'     => 'DATETIME',
+    'test_code'             => 'VARCHAR(100)',
+    'vcm_temp_hot_bar_tol'  => 'TEXT',
+    'vcm_temp_cold_bar_tol' => 'TEXT',
+    'test_started_datetime'   => 'DATETIME',
+    'test_completed_datetime' => 'DATETIME',
+    'test_duration'           => 'TEXT',
+    'test_on_time'            => 'VARCHAR(50)',
+    'specimen_collected_by_name'  => 'TEXT',
+    'specimen_collected_by_sig'   => 'TEXT',
+    'verification_closed_by_name' => 'TEXT',
+    'verification_closed_by_sig'  => 'TEXT',
+    'completion_date'         => 'DATETIME',
+    'draft_saved_at'          => 'DATETIME',
+    'draft_saved_by'          => 'VARCHAR(100)',
 ];
 if (is_array($existing_cols)) {
     // 1. DROP legacy columns immediately to make room
@@ -225,7 +272,7 @@ if (is_array($existing_cols)) {
         'chamber_used',
         'pt_name_of_object','pt_frequency_band','pt_quantity','pt_pressure_range','pt_special_requirements','pt_key_characteristics',
         'bk_vacuum_level','bk_temperature','bk_dwell_time','bk_profile_attached','bk_profile_file','bk_monitor_base_plate','bk_monitor_test_specimen','bk_date_of_test_requirement','bk_special_requirements','bk_key_characteristics',
-        'requisition_received_date','risk_form_filled','special_processes','test_received_reviewed','test_accepted_by',
+        'requisition_received_date','risk_form_filled','special_processes',
         'env_vacuum','env_shroud_temp','env_solar_beam','env_eclipse','env_motion_tilt','env_tilt_rate','env_tilt_position','env_motion_spin','env_spin_rate','env_spin_position','env_motion_speed','env_mechanical','env_special_req','env_key_char',
         'env_vacuum_comment','env_shroud_comment','env_solar_comment','env_eclipse_comment','env_motion_comment','env_mechanical_comment','env_special_comment','env_key_comment',
         'risk_assessed','rpn','risk_record','test_type_etf'
@@ -272,8 +319,9 @@ if (is_array($existing_cols)) {
         $wpdb->query("ALTER TABLE {$table} MODIFY COLUMN status VARCHAR(50) DEFAULT 'draft_indenter'");
     }
 
-    // RETROACTIVE FIX: Convert existing PENDING/DRAFT TR numbers to REQXXXXX (approved plan)
-    $wpdb->query("UPDATE {$table} SET test_requisition_no = CONCAT('REQ', LPAD(id, 5, '0')) WHERE test_requisition_no LIKE 'PENDING-%' OR test_requisition_no LIKE 'DRAFT-%'");
+    // RETROACTIVE FIX: Convert existing PENDING TR numbers to REQXXXXX (approved plan)
+    // Drafts should keep their DRAFT- prefix for clarity
+    $wpdb->query("UPDATE {$table} SET test_requisition_no = CONCAT('REQ', LPAD(id, 5, '0')) WHERE test_requisition_no LIKE 'PENDING-%'");
 }
 
 // ========== HELPERS ==========
@@ -298,13 +346,136 @@ function uhv_notify_managers($wpdb, $tr_no, $name) {
     $mgrs = $wpdb->get_results("SELECT DISTINCT email FROM {$wpdb->prefix}employee_table_2 WHERE funcdesg LIKE '%MANAGER%' AND email IS NOT NULL AND email!=''");
     // foreach ($mgrs as $m) wp_mail($m->email, "New UHV Request - $tr_no", "Submitted by $name\nTR No: $tr_no");
 }
-function uhv_notify_indenter($form) {
-    $u = get_userdata($form->user_id);
-    // if ($u) wp_mail($u->user_email, "UHV Request {$form->test_requisition_no} - {$form->status}", "Status: {$form->status}");
+function uhv_notify_user($form) {
+    if (!$form) return;
+    $user_id = $form->user_id;
+    if (!$user_id) return;
+    $u = get_userdata($user_id);
+    if (!$u || empty($u->user_email)) return;
+    
+    $status_label = str_replace('_', ' ', $form->status);
+    $subject = "UHV Test Request Update: {$form->test_requisition_no}";
+    $body = "Dear User,\n\nThe status of your UHV Test Request ({$form->test_requisition_no}) has been updated.\n\nCurrent Status: " . strtoupper($status_label) . "\n\nPlease login to the ISITE portal to view details.";
+    // wp_mail($u->user_email, $subject, $body);
 }
 function uhv_notify_uhv($wpdb, $form) {
     $UHV = $wpdb->get_results("SELECT DISTINCT email FROM {$wpdb->prefix}employee_table_2 WHERE sectionfullname LIKE '%LARGE SPACE%' AND email IS NOT NULL AND email!=''");
     // foreach ($UHV as $e) wp_mail($e->email, "UHV Request Approved - {$form->test_requisition_no}", "TR: {$form->test_requisition_no}");
+}
+
+
+function uhv_get_selected_test_labels($form) {
+    if (!$form) return [];
+    $labels = [];
+    $raw = !empty($form->test_types) ? $form->test_types : ($form->test_type ?? '');
+    if (!empty($raw)) {
+        // Use a more robust split that handles potential ampersand encoding issues
+        $parts = preg_split('/\s*,\s*/', (string)$raw);
+        foreach ($parts as $part) {
+            $part = trim(htmlspecialchars_decode((string)$part, ENT_QUOTES));
+            if ($part !== '') $labels[] = $part;
+        }
+    }
+    if (empty($labels) && !empty($form->test_type)) {
+        $labels[] = trim(htmlspecialchars_decode((string)$form->test_type, ENT_QUOTES));
+    }
+    return array_values(array_unique(array_filter($labels)));
+}
+
+function uhv_get_per_test_risk($form) {
+    if (empty($form->per_test_risk_json)) {
+        $map = [];
+        foreach (uhv_get_selected_test_labels($form) as $label) {
+            $map[$label] = ['test_object_accepted'=>'','risk_assessed_uhv'=>'','rpn_uhv'=>'','risk_record_uhv'=>''];
+        }
+        return $map;
+    }
+    
+    $data = json_decode($form->per_test_risk_json, true) ?: [];
+    // Convert indexed array to label-keyed map if needed
+    if (isset($data[0]) && is_array($data[0]) && isset($data[0]['test_label'])) {
+        $map = [];
+        foreach ($data as $item) {
+            $label = $item['test_label'];
+            $map[$label] = $item;
+        }
+        return $map;
+    }
+    return $data; // Already associative or empty
+}
+
+function uhv_render_per_test_risk_readonly($form, $title = 'Per-Test Risk Assessment') {
+    $risk_map = uhv_get_per_test_risk($form);
+    if (empty($risk_map)) return;
+    echo '<div style="margin-top:18px;"><h4 style="margin:0 0 10px;">' . esc_html($title) . '</h4>';
+    
+    foreach ($risk_map as $test_label => $risk) {
+        $rpn = $risk['rpn_uhv'] ?? '';
+        $rpn_label = $rpn === 'lt4' ? '&le; 4' : ($rpn === 'gte5' ? '&ge; 5' : '&mdash;');
+        echo '<table style="width:100%; border-collapse:collapse; margin-bottom:20px; font-size:14px; border:1px solid #000;">';
+        echo '<tr style="background:#f8f9fa;"><th colspan="3" style="border:1px solid #000; padding:10px; text-align:left; color:#0d6efd; font-weight:700;">Test requisitioned: ' . esc_html($test_label) . '</th></tr>';
+        echo '<tr>';
+        echo '<td style="border:1px solid #000; padding:10px; width:60%;">Test request received, reviewed and accepted for testing</td>';
+        echo '<td colspan="2" style="border:1px solid #000; padding:10px; text-align:center; font-weight:600;">' . esc_html(ucfirst(strtolower($risk['test_object_accepted'] ?? '—'))) . '</td>';
+        echo '</tr>';
+        echo '<tr>';
+        echo '<td style="border:1px solid #000; padding:10px;">Risk Assessed as per Online QMS UHV Lab Risk Table<br><span style="font-weight:600;">Result: ' . esc_html(ucfirst(strtolower($risk['risk_assessed_uhv'] ?? '—'))) . '</span></td>';
+        echo '<td style="border:1px solid #000; padding:10px;">Risk Priority No.(RPN): <span style="font-weight:600;">' . $rpn_label . '</span>';
+        if (!empty($risk['risk_table_url'])) {
+            echo '<br><a href="' . esc_url($risk['risk_table_url']) . '" target="_blank" style="color:#0d6efd; text-decoration:underline;">View Risk Table</a>';
+        }
+        echo '<br><small>(as per online QMS Risk Table to be filled if RPN &ge; 5)</small></td>';
+        echo '<td style="border:1px solid #000; padding:10px; text-align:center;">Risk Record:<br><span style="font-weight:600;">' . strtoupper(esc_html($risk['risk_record_uhv'] ?? 'NA')) . '</span></td>';
+        echo '</tr>';
+        echo '</table>';
+    }
+    if (!empty($form->staff_review_date)) {
+        // Try to get staff name from history
+        $staff_name = 'UHV Staff';
+        $history = uhv_get_history_data($form->id);
+        foreach ($history as $h) {
+            if ($h['action_label'] === 'Staff Review Completed') {
+                $staff_name = $h['done_by'];
+                break;
+            }
+        }
+        echo '<div style="margin-top:10px; padding:10px; background:#f0f7ff; border:1px solid #007bff; border-radius:4px; font-size:14px;">';
+        echo '<strong>Reviewed By:</strong> ' . esc_html($staff_name) . ' | <strong>Date:</strong> ' . date('d M Y, h:i A', strtotime($form->staff_review_date));
+        echo '</div>';
+    }
+    echo '</div>';
+}
+
+/**
+ * Renders Section B & C details (Test Execution & Closure) in read-only mode.
+ */
+function uhv_render_execution_details_readonly($req) {
+    if (!$req || empty($req->test_started_datetime)) return;
+    
+    echo '<div style="margin-top:25px; border:1px solid #000; border-radius:6px; overflow:hidden;">';
+    
+    // Section B
+    echo '<h3 style="margin:0; padding:12px; background:#f8f9fa; border-bottom:1px solid #000; font-size:17px; font-weight:700; text-transform:uppercase;">SECTION B — TEST EXECUTION DETAILS</h3>';
+    echo '<table style="width:100%; border-collapse:collapse; font-size:16px;">';
+    echo '<tr><th style="border:1px solid #000; padding:15px; text-align:left; background:#fff; width:45%;">Test Started on</th><td style="border:1px solid #000; padding:15px;">' . (!empty($req->test_started_datetime) ? date('d M Y, h:i A', strtotime($req->test_started_datetime)) : '—') . '</td></tr>';
+    echo '<tr><th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Test Completed on</th><td style="border:1px solid #000; padding:15px;">' . (!empty($req->test_completed_datetime) ? date('d M Y, h:i A', strtotime($req->test_completed_datetime)) : '—') . '</td></tr>';
+    echo '<tr><th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Test Duration</th><td style="border:1px solid #000; padding:15px;">' . esc_html($req->test_duration ?? '—') . '</td></tr>';
+    echo '<tr><th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Test Completed On-Time?</th><td style="border:1px solid #000; padding:15px;">' . esc_html($req->test_on_time ?? '—') . '</td></tr>';
+    echo '<tr><th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Test Code</th><td style="border:1px solid #000; padding:15px;">' . esc_html($req->test_code ?? '—') . '</td></tr>';
+    echo '</table>';
+    
+    // Section C
+    echo '<h3 style="margin:0; padding:12px; background:#f8f9fa; border:1px solid #000; border-left:none; border-right:none; font-size:17px; font-weight:700; text-transform:uppercase;">SECTION C — SPECIMEN COLLECTION &amp; CLOSURE</h3>';
+    echo '<table style="width:100%; border-collapse:collapse; font-size:16px;">';
+    echo '<tr style="background:#000; color:#fff;"><th colspan="2" style="padding:10px; text-align:left; font-weight:600;">Test Specimen Collected By</th></tr>';
+    echo '<tr><th style="border:1px solid #000; padding:15px; text-align:left; background:#fff; width:45%;">Name</th><td style="border:1px solid #000; padding:15px;">' . esc_html($req->specimen_collected_by_name ?? '—') . '</td></tr>';
+    echo '<tr><th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Signature / Initials</th><td style="border:1px solid #000; padding:15px;">' . esc_html($req->specimen_collected_by_sig ?? '—') . '</td></tr>';
+    echo '<tr style="background:#000; color:#fff;"><th colspan="2" style="padding:10px; text-align:left; font-weight:600;">Verification &amp; Requisition Closed By</th></tr>';
+    echo '<tr><th style="border:1px solid #000; padding:15px; text-align:left; background:#fff; width:45%;">Name</th><td style="border:1px solid #000; padding:15px;">' . esc_html($req->verification_closed_by_name ?? '—') . '</td></tr>';
+    echo '<tr><th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Signature / Initials</th><td style="border:1px solid #000; padding:15px;">' . esc_html($req->verification_closed_by_sig ?? '—') . '</td></tr>';
+    echo '</table>';
+    
+    echo '</div>';
 }
 
 // ========== HISTORY LOG HELPER — appends one entry to history_log JSON column ==========
@@ -416,6 +587,8 @@ function uhvShowHistory(varId) {
     'Form Submitted':             {bg:'#e8f5e9',border:'#28a745',icon:'📤',color:'#155724'},
     'QA Accepted':                {bg:'#e8f5e9',border:'#28a745',icon:'✅',color:'#155724'},
     'QA Rejected':                {bg:'#fdecea',border:'#dc3545',icon:'❌',color:'#721c24'},
+    'Staff Review Completed':     {bg:'#e8f5e9',border:'#28a745',icon:'📋',color:'#155724'},
+    'Staff Sent for Recheck':     {bg:'#fff8e1',border:'#fd7e14',icon:'↩', color:'#7a3e00'},
     'Manager Approved':           {bg:'#e8f5e9',border:'#28a745',icon:'✔️',color:'#155724'},
     'Manager Rejected':           {bg:'#fdecea',border:'#dc3545',icon:'❌',color:'#721c24'},
     'Manager Sent for Recheck':   {bg:'#fff8e1',border:'#fd7e14',icon:'↺', color:'#7a3e00'},
@@ -459,49 +632,50 @@ function uhv_dashboard_buttons($emp) {
     global $wpdb;
     $table = $wpdb->prefix . 'uhv_form';
     $my_qa_pending_count = (int)$wpdb->get_var($wpdb->prepare(
-        "SELECT COUNT(*) FROM {$table} WHERE qa_stno=%s AND (status='pending_qa' OR (status='pending' AND qa_decision=''))",
+        "SELECT COUNT(*) FROM {$table} WHERE qa_stno=%s AND (status='pending_qa' OR (status IN ('pending_manager','pending') AND qa_decision=''))",
         $emp->stno
     ));
+    $show_staff = !empty($GLOBALS['can_fill_staff_form']);
     ?>
     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
       <?php if ($GLOBALS['user_role'] !== 'manager'): ?>
+      <?php if ($show_staff): ?>
       <a href="<?php echo esc_url(add_query_arg('action','view_staff', get_permalink())); ?>"
          class="btn" style="background:#17a2b8;color:#fff;padding:12px 22px;">
         &#128196; VIEW STAFF FORM
       </a>
+      <?php endif; ?>
       <a href="<?php echo esc_url(add_query_arg('action','qa_dashboard', get_permalink())); ?>"
          class="btn" style="background:#6f42c1;color:#fff;padding:12px 22px;position:relative;">
         &#10003; QA REVIEW
-        <span style="background:#dc3545;color:#fff;border-radius:50%;padding:1px 7px;font-size:11px;font-weight:700;margin-left:6px;"><?php echo $my_qa_pending_count; ?></span>
+        <span style="background:<?php echo $my_qa_pending_count > 0 ? '#dc3545' : '#6c757d'; ?>;color:#fff;border-radius:50%;padding:1px 7px;font-size:11px;font-weight:700;margin-left:6px;"><?php echo (int) $my_qa_pending_count; ?></span>
       </a>
       <?php endif; ?>
     </div>
     <?php
 }
 
-function uhv_indenter_stat_cards($cnt_pending, $cnt_qa_pending, $cnt_testing, $cnt_rejected, $cnt_completed) {
-    if ($cnt_qa_pending === 0) {
-        $cnt_qa_pending = (int)get_transient('mgr_qa_count_' . get_current_user_id());
+function uhv_user_stat_cards($cnt_pending, $cnt_qa_pending, $cnt_testing, $cnt_rejected, $cnt_completed) {
+    if ((int) $cnt_qa_pending === 0) {
+        $cnt_qa_pending = (int) get_transient('mgr_qa_count_' . get_current_user_id());
     }
     $base = get_permalink(); ?>
 <div class="stat-grid">
-  <div class="stat-card sc-pending">
+  <a href="<?php echo esc_url(get_permalink()); ?>" class="stat-card sc-pending" style="text-decoration:none;">
     <div class="stat-num"><?php echo $cnt_pending; ?></div><div class="stat-lbl">Pending Approval</div>
-  </div>
-  <?php if ($cnt_qa_pending > 0): ?>
-  <a href="<?php echo esc_url(add_query_arg('action','qa_dashboard',$base)); ?>" class="stat-card" style="border-color:#6f42c1;background:#faf7ff;color:#6f42c1;text-decoration:none;cursor:pointer;">
-    <div class="stat-num"><?php echo $cnt_qa_pending; ?></div><div class="stat-lbl">My QA Reviews Pending</div>
   </a>
-  <?php endif; ?>
-  <div class="stat-card sc-approved">
+  <a href="<?php echo esc_url(add_query_arg('action','qa_dashboard',$base)); ?>" class="stat-card" style="border-color:#6f42c1;background:#faf7ff;color:#6f42c1;text-decoration:none;cursor:pointer;">
+    <div class="stat-num"><?php echo (int) $cnt_qa_pending; ?></div><div class="stat-lbl">My QA Reviews Pending</div>
+  </a>
+  <a href="<?php echo esc_url(get_permalink()); ?>" class="stat-card sc-approved" style="text-decoration:none;">
     <div class="stat-num"><?php echo $cnt_testing; ?></div><div class="stat-lbl">In Testing</div>
-  </div>
-  <div class="stat-card" style="border-color:#dc3545;background:#fff8f0;color:#7d3c00;">
+  </a>
+  <a href="<?php echo esc_url(get_permalink()); ?>" class="stat-card" style="border-color:#dc3545;background:#fff8f0;color:#7d3c00;text-decoration:none;">
     <div class="stat-num"><?php echo $cnt_rejected; ?></div><div class="stat-lbl">Rejected / Returned</div>
-  </div>
-  <div class="stat-card" style="border-color:#000;background:#f8f8f8;color:#000;">
+  </a>
+  <a href="<?php echo esc_url(get_permalink()); ?>" class="stat-card" style="border-color:#000;background:#f8f8f8;color:#000;text-decoration:none;">
     <div class="stat-num"><?php echo $cnt_completed; ?></div><div class="stat-lbl">Completed</div>
-  </div>
+  </a>
 </div>
 <?php }
 
@@ -509,7 +683,9 @@ function uhv_indenter_stat_cards($cnt_pending, $cnt_qa_pending, $cnt_testing, $c
 
 /* ---------- INDENTER SAVE DRAFT ---------- */
 if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['save_indenter_draft'])) {
-    if ($user_role!=='indenter' && $user_role!=='manager') wp_die('Unauthorized');
+    if (!uhv_can_edit_test_request($user_role)) {
+        wp_die('Unauthorized');
+    }
     if (!wp_verify_nonce($_POST['uhv_nonce'],'uhv_action')) wp_die('Security check failed');
 
     $draft_id = intval($_POST['draft_id'] ?? 0);
@@ -575,31 +751,65 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['save_indenter_draft']))
         'indenter_draft_saved_at'=> date('Y-m-d H:i:s'),
         'indenter_draft_saved_by'=> $emp->name,
         // Multi-test type fields
-        'test_types'             => sanitize_text_field(implode(',', array_filter(array_map('sanitize_text_field', (array)($_POST['test_types'] ?? []))))),
+        'test_types'             => sanitize_text_field(implode(', ', array_filter(array_map('sanitize_text_field', (array)($_POST['test_types'] ?? []))))),
         // Multipaction Test fields
-        'mp_package_name'       => sanitize_text_field($_POST['mp_package_name'] ?? ''),
-        'mp_package_size'       => sanitize_text_field($_POST['mp_package_size'] ?? ''),
+        'mp_package_size'       => (function() {
+            $size = [
+                'l' => sanitize_text_field($_POST['mp_package_l'] ?? ''),
+                'b' => sanitize_text_field($_POST['mp_package_b'] ?? ''),
+                'h' => sanitize_text_field($_POST['mp_package_h'] ?? ''),
+            ];
+            return json_encode($size);
+        })(),
         'mp_test_profile_attach'=> sanitize_text_field($_POST['mp_test_profile_attach'] ?? ''),
-        'mp_thermocouples'      => sanitize_text_field($_POST['mp_thermocouples'] ?? ''),
+        'mp_test_profile_file'  => (function() {
+            if (!empty($_FILES['mp_test_profile_file']['name'])) {
+                if (!function_exists('wp_handle_upload')) require_once ABSPATH . 'wp-admin/includes/file.php';
+                $upload = wp_handle_upload($_FILES['mp_test_profile_file'], ['test_form' => false]);
+                return !empty($upload['url']) ? $upload['url'] : ($_POST['mp_test_profile_file_existing'] ?? '');
+            }
+            return sanitize_text_field($_POST['mp_test_profile_file_existing'] ?? '');
+        })(),
+        'mp_thermocouples'      => max(0, intval($_POST['mp_thermocouples'] ?? 0)),
         'mp_ft_rf_qty'          => intval($_POST['mp_ft_rf_qty'] ?? 0),
         'mp_ft_elec_qty'        => intval($_POST['mp_ft_elec_qty'] ?? 0),
         'mp_ft_others_spec'     => sanitize_text_field($_POST['mp_ft_others_spec'] ?? ''),
         'mp_ft_others_qty'      => intval($_POST['mp_ft_others_qty'] ?? 0),
         'mp_special_instructions'=> sanitize_textarea_field($_POST['mp_special_instructions'] ?? ''),
         // TVC fields
-        'tvc_specimen_name'     => sanitize_text_field($_POST['tvc_specimen_name'] ?? ''),
-        'tvc_package_size'      => sanitize_text_field($_POST['tvc_package_size'] ?? ''),
-        'tvc_vacuum_range'      => sanitize_text_field($_POST['tvc_vacuum_range'] ?? ''),
+        
+                'tvc_package_size'      => (function() {
+            $size = [
+                'l' => sanitize_text_field($_POST['tvc_package_l'] ?? ''),
+                'b' => sanitize_text_field($_POST['tvc_package_b'] ?? ''),
+                'h' => sanitize_text_field($_POST['tvc_package_h'] ?? ''),
+            ];
+            return json_encode($size);
+        })(),
+
+                'tvc_vacuum_range'      => (function() {
+            $vac = [
+                'mantissa' => sanitize_text_field($_POST['tvc_vacuum_mantissa'] ?? ''),
+                'exponent' => sanitize_text_field($_POST['tvc_vacuum_exponent'] ?? ''),
+            ];
+            return json_encode($vac);
+        })(),
+
         'tvc_temp_hot'          => sanitize_text_field($_POST['tvc_temp_hot'] ?? ''),
         'tvc_temp_hot_tol'      => sanitize_text_field($_POST['tvc_temp_hot_tol'] ?? ''),
         'tvc_temp_cold'         => sanitize_text_field($_POST['tvc_temp_cold'] ?? ''),
         'tvc_temp_cold_tol'     => sanitize_text_field($_POST['tvc_temp_cold_tol'] ?? ''),
         'tvc_duration_hot'      => sanitize_text_field($_POST['tvc_duration_hot'] ?? ''),
         'tvc_duration_cold'     => sanitize_text_field($_POST['tvc_duration_cold'] ?? ''),
-        'tvc_cycles_required'   => sanitize_text_field($_POST['tvc_cycles_required'] ?? ''),
-        'tvc_start_cycle'       => sanitize_text_field($_POST['tvc_start_cycle'] ?? ''),
-        'tvc_thermocouples'     => sanitize_text_field($_POST['tvc_thermocouples'] ?? ''),
-        'tvc_instructions'      => sanitize_textarea_field($_POST['tvc_instructions'] ?? ''),
+                'tvc_cycles_required'   => intval($_POST['tvc_cycles_required'] ?? 0),
+
+                'tvc_start_cycle'       => sanitize_text_field($_POST['tvc_start_cycle'] ?? 'Hot'),
+
+                'tvc_thermocouples'     => intval($_POST['tvc_thermocouples'] ?? 0),
+
+                'tvc_instructions'      => sanitize_textarea_field($_POST['tvc_instructions'] ?? ''),
+        'tvc_other_tests'       => sanitize_textarea_field($_POST['tvc_other_tests'] ?? ''),
+
         // VCM fields
         'vcm_samples_json'      => (function() {
             $data = [];
@@ -616,28 +826,46 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['save_indenter_draft']))
             }
             return json_encode($data);
         })(),
-        'vcm_vacuum_req'        => sanitize_text_field($_POST['vcm_vacuum_req'] ?? ''),
-        'vcm_duration'          => sanitize_text_field($_POST['vcm_duration'] ?? ''),
-        'vcm_samples_loaded'    => sanitize_text_field($_POST['vcm_samples_loaded'] ?? ''),
-        'vcm_temp_hot_bar'      => sanitize_text_field($_POST['vcm_temp_hot_bar'] ?? ''),
-        'vcm_temp_cold_bar'     => sanitize_text_field($_POST['vcm_temp_cold_bar'] ?? ''),
+                'vcm_vacuum_req'        => (function() {
+            $vac = [
+                'mantissa' => sanitize_text_field($_POST['vcm_vacuum_mantissa'] ?? ''),
+                'exponent' => sanitize_text_field($_POST['vcm_vacuum_exponent'] ?? ''),
+            ];
+            return json_encode($vac);
+        })(),
+
+                'vcm_duration'          => intval($_POST['vcm_duration'] ?? 0),
+
+                'vcm_samples_loaded'    => intval($_POST['vcm_samples_loaded'] ?? 0),
+
+                'vcm_temp_hot_bar'      => uhv_form_sanitize_opt_numeric('vcm_temp_hot_bar'),
+        'vcm_temp_hot_bar_tol'  => uhv_form_sanitize_opt_numeric('vcm_temp_hot_bar_tol'),
+
+                'vcm_temp_cold_bar'     => uhv_form_sanitize_opt_numeric('vcm_temp_cold_bar'),
+        'vcm_temp_cold_bar_tol' => uhv_form_sanitize_opt_numeric('vcm_temp_cold_bar_tol'),
+
         'msld_samples_json'      => (function() {
             $data = [];
             $qtys = $_POST['msld_qty'] ?? [];
             $remarks = $_POST['msld_remarks'] ?? [];
+            $others_spec = sanitize_text_field($_POST['msld_others_spec'] ?? '');
             $msld_rows = [
                 "Heat pipe / HMC cases",
                 "Thermal / Electrical / RF / Thermocouple feedthrough",
                 "Shrouds / Bellows",
                 "Vacuum lines & fittings",
                 "Wave guides / Valves / Gauges",
-                "Others (Specify)"
+                "Others"
             ];
             foreach($msld_rows as $idx => $desc) {
-                $data[] = [
+                $row = [
                     'qty'     => sanitize_text_field($qtys[$idx] ?? ''),
                     'remarks' => sanitize_text_field($remarks[$idx] ?? ''),
                 ];
+                if ($desc === "Others") {
+                    $row['others_spec'] = $others_spec;
+                }
+                $data[] = $row;
             }
             return json_encode($data);
         })(),
@@ -736,7 +964,9 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['save_indenter_draft']))
         set_transient('uhv_errors_' . $user->ID, ['Draft could not be saved. Database error: ' . $wpdb->last_error], 60);
         $fail_redirect = ($user_role === 'manager')
             ? add_query_arg(['mgr_action' => 'create_new', 'uhv_msg' => 'error'], get_permalink())
-            : add_query_arg('uhv_msg', 'error', get_permalink());
+            : (($user_role === 'UHV')
+                ? add_query_arg(['action' => 'create_new', 'uhv_msg' => 'error'], get_permalink())
+                : add_query_arg('uhv_msg', 'error', get_permalink()));
         wp_redirect($fail_redirect);
         exit;
     }
@@ -746,9 +976,9 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['save_indenter_draft']))
         uhv_log_history($wpdb, $saved_draft_id, 'Draft Saved', 'none', 'draft_indenter', $emp->name, $emp->stno, $user_role, '');
     }
 
-    // Standardize TR numbering if it's currently generic
+    // Standardize TR numbering for submitted requests; Drafts are handled separately
     $cur_tr = $wpdb->get_var($wpdb->prepare("SELECT test_requisition_no FROM {$table} WHERE id=%d", $saved_draft_id));
-    if ($cur_tr && preg_match('/^(DRAFT|PENDING)-/', $cur_tr)) {
+    if ($cur_tr && preg_match('/^PENDING-/', $cur_tr)) {
         $tr_no = 'REQ' . str_pad($saved_draft_id, 5, '0', STR_PAD_LEFT);
         $wpdb->update($table, ['test_requisition_no' => $tr_no], ['id' => $saved_draft_id]);
     }
@@ -757,9 +987,12 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['save_indenter_draft']))
     $saved_final_status = $wpdb->get_var($wpdb->prepare("SELECT status FROM {$table} WHERE id=%d", $saved_draft_id));
     if ($user_role === 'manager') {
         wp_redirect(add_query_arg(['mgr_action' => 'create_new', 'resume_draft' => $saved_draft_id, 'uhv_msg' => 'draft_saved'], remove_query_arg(['action','view_id','complete_id','prog_id'], get_permalink())));
-    } elseif (in_array($saved_final_status, ['qa_rejected', 'rejected', 'recheck_indenter'])) {
+    } elseif (in_array($saved_final_status, ['qa_rejected', 'rejected', 'recheck_indenter'], true)) {
         // Stay in the edit form so the context banner (QA remarks / manager comment) is still visible
         wp_redirect(add_query_arg(['action' => 'create_new', 'resume_draft' => $saved_draft_id, 'uhv_msg' => 'draft_saved'], remove_query_arg(['view_id','mgr_action','complete_id','prog_id'], get_permalink())));
+    } elseif ($user_role === 'UHV') {
+        // UHV default dashboard is staff lists; keep user on the TR form after save
+        wp_redirect(add_query_arg(['action' => 'create_new', 'resume_draft' => $saved_draft_id, 'uhv_msg' => 'draft_saved'], remove_query_arg(['view_id','resume_draft','mgr_action','complete_id','prog_id'], get_permalink())));
     } else {
         wp_redirect(add_query_arg(['uhv_msg' => 'draft_saved', 'resume_draft' => $saved_draft_id], remove_query_arg(['action','view_id','resume_draft','mgr_action','complete_id','prog_id'], get_permalink())));
     }
@@ -768,13 +1001,16 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['save_indenter_draft']))
 
 /* ---------- INDENTER/MANAGER SUBMIT FOR APPROVAL ---------- */
 if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['submit_request'])) {
-    if ($user_role!=='indenter' && $user_role!=='manager') wp_die('Unauthorized');
+    if (!uhv_can_edit_test_request($user_role)) {
+        wp_die('Unauthorized');
+    }
     if (!wp_verify_nonce($_POST['uhv_nonce'],'uhv_action')) wp_die('Security check failed');
 
     $form_id = intval($_POST['draft_id'] ?? 0);
     $is_resubmit = ($form_id > 0);
     $qa_required = strtolower(sanitize_text_field($_POST['qa_exists'] ?? 'no'));
-    $submission_status = ($qa_required === 'yes') ? 'pending_qa' : 'pending';
+    // Overhaul: If QA is not selected, it goes to Staff Review first (pending_staff)
+    $submission_status = ($qa_required === 'yes') ? 'pending_qa' : 'pending_staff';
     if (!empty($_FILES['bk_profile_file']['name'])) {
         if (!function_exists('wp_handle_upload')) require_once ABSPATH . 'wp-admin/includes/file.php';
         $bk_upload = wp_handle_upload($_FILES['bk_profile_file'], ['test_form' => false]);
@@ -805,7 +1041,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['submit_request'])) {
             if (!in_array($qa_required, ['yes', 'no'])) {
                 $qa_required = 'no';
             }
-            $submission_status = ($qa_required === 'yes') ? 'pending_qa' : 'pending';
+            $submission_status = ($qa_required === 'yes') ? 'pending_qa' : 'pending_staff';
             
             $manager_submit_data = [
                 'test_requisition_no'    => 'PENDING-' . $user->ID . '-' . uniqid(),
@@ -911,31 +1147,64 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['submit_request'])) {
                 'user_id'                => $user->ID,
                 'status'                 => $submission_status,
         // Multi-test type & sub-form fields
-        'test_types'             => sanitize_text_field(implode(',', array_filter(array_map('sanitize_text_field', (array)($_POST['test_types'] ?? []))))),
+        'test_types'             => sanitize_text_field(implode(', ', array_filter(array_map('sanitize_text_field', (array)($_POST['test_types'] ?? []))))),
         // Multipaction Test fields
-        'mp_package_name'       => sanitize_text_field($_POST['mp_package_name'] ?? ''),
-        'mp_package_size'       => sanitize_text_field($_POST['mp_package_size'] ?? ''),
+        'mp_package_size'       => (function() {
+            $size = [
+                'l' => sanitize_text_field($_POST['mp_package_l'] ?? ''),
+                'b' => sanitize_text_field($_POST['mp_package_b'] ?? ''),
+                'h' => sanitize_text_field($_POST['mp_package_h'] ?? ''),
+            ];
+            return json_encode($size);
+        })(),
         'mp_test_profile_attach'=> sanitize_text_field($_POST['mp_test_profile_attach'] ?? ''),
-        'mp_thermocouples'      => sanitize_text_field($_POST['mp_thermocouples'] ?? ''),
+        'mp_test_profile_file'  => (function() {
+            if (!empty($_FILES['mp_test_profile_file']['name'])) {
+                if (!function_exists('wp_handle_upload')) require_once ABSPATH . 'wp-admin/includes/file.php';
+                $upload = wp_handle_upload($_FILES['mp_test_profile_file'], ['test_form' => false]);
+                return !empty($upload['url']) ? $upload['url'] : ($_POST['mp_test_profile_file_existing'] ?? '');
+            }
+            return sanitize_text_field($_POST['mp_test_profile_file_existing'] ?? '');
+        })(),
+        'mp_thermocouples'      => max(0, intval($_POST['mp_thermocouples'] ?? 0)),
         'mp_ft_rf_qty'          => intval($_POST['mp_ft_rf_qty'] ?? 0),
         'mp_ft_elec_qty'        => intval($_POST['mp_ft_elec_qty'] ?? 0),
         'mp_ft_others_spec'     => sanitize_text_field($_POST['mp_ft_others_spec'] ?? ''),
         'mp_ft_others_qty'      => intval($_POST['mp_ft_others_qty'] ?? 0),
         'mp_special_instructions'=> sanitize_textarea_field($_POST['mp_special_instructions'] ?? ''),
         // TVC fields
-        'tvc_specimen_name'     => sanitize_text_field($_POST['tvc_specimen_name'] ?? ''),
-        'tvc_package_size'      => sanitize_text_field($_POST['tvc_package_size'] ?? ''),
-        'tvc_vacuum_range'      => sanitize_text_field($_POST['tvc_vacuum_range'] ?? ''),
+                'tvc_package_size'      => (function() {
+            $size = [
+                'l' => sanitize_text_field($_POST['tvc_package_l'] ?? ''),
+                'b' => sanitize_text_field($_POST['tvc_package_b'] ?? ''),
+                'h' => sanitize_text_field($_POST['tvc_package_h'] ?? ''),
+            ];
+            return json_encode($size);
+        })(),
+
+                'tvc_vacuum_range'      => (function() {
+            $vac = [
+                'mantissa' => sanitize_text_field($_POST['tvc_vacuum_mantissa'] ?? ''),
+                'exponent' => sanitize_text_field($_POST['tvc_vacuum_exponent'] ?? ''),
+            ];
+            return json_encode($vac);
+        })(),
+
+        
         'tvc_temp_hot'          => sanitize_text_field($_POST['tvc_temp_hot'] ?? ''),
         'tvc_temp_hot_tol'      => sanitize_text_field($_POST['tvc_temp_hot_tol'] ?? ''),
         'tvc_temp_cold'         => sanitize_text_field($_POST['tvc_temp_cold'] ?? ''),
         'tvc_temp_cold_tol'     => sanitize_text_field($_POST['tvc_temp_cold_tol'] ?? ''),
         'tvc_duration_hot'      => sanitize_text_field($_POST['tvc_duration_hot'] ?? ''),
         'tvc_duration_cold'     => sanitize_text_field($_POST['tvc_duration_cold'] ?? ''),
-        'tvc_cycles_required'   => sanitize_text_field($_POST['tvc_cycles_required'] ?? ''),
+                'tvc_cycles_required'   => intval($_POST['tvc_cycles_required'] ?? 0),
+
         'tvc_start_cycle'       => sanitize_text_field($_POST['tvc_start_cycle'] ?? ''),
-        'tvc_thermocouples'     => sanitize_text_field($_POST['tvc_thermocouples'] ?? ''),
-        'tvc_instructions'      => sanitize_textarea_field($_POST['tvc_instructions'] ?? ''),
+                'tvc_thermocouples'     => intval($_POST['tvc_thermocouples'] ?? 0),
+
+                'tvc_instructions'      => sanitize_textarea_field($_POST['tvc_instructions'] ?? ''),
+        'tvc_other_tests'       => sanitize_textarea_field($_POST['tvc_other_tests'] ?? ''),
+
         // VCM fields
         'vcm_samples_json'      => (function() {
             $data = [];
@@ -952,28 +1221,46 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['submit_request'])) {
             }
             return json_encode($data);
         })(),
-        'vcm_vacuum_req'        => sanitize_text_field($_POST['vcm_vacuum_req'] ?? ''),
-        'vcm_duration'          => sanitize_text_field($_POST['vcm_duration'] ?? ''),
-        'vcm_samples_loaded'    => sanitize_text_field($_POST['vcm_samples_loaded'] ?? ''),
-        'vcm_temp_hot_bar'      => sanitize_text_field($_POST['vcm_temp_hot_bar'] ?? ''),
-        'vcm_temp_cold_bar'     => sanitize_text_field($_POST['vcm_temp_cold_bar'] ?? ''),
+                'vcm_vacuum_req'        => (function() {
+            $vac = [
+                'mantissa' => sanitize_text_field($_POST['vcm_vacuum_mantissa'] ?? ''),
+                'exponent' => sanitize_text_field($_POST['vcm_vacuum_exponent'] ?? ''),
+            ];
+            return json_encode($vac);
+        })(),
+
+                'vcm_duration'          => intval($_POST['vcm_duration'] ?? 0),
+
+                'vcm_samples_loaded'    => intval($_POST['vcm_samples_loaded'] ?? 0),
+
+                'vcm_temp_hot_bar'      => uhv_form_sanitize_opt_numeric('vcm_temp_hot_bar'),
+        'vcm_temp_hot_bar_tol'  => uhv_form_sanitize_opt_numeric('vcm_temp_hot_bar_tol'),
+
+                'vcm_temp_cold_bar'     => uhv_form_sanitize_opt_numeric('vcm_temp_cold_bar'),
+        'vcm_temp_cold_bar_tol' => uhv_form_sanitize_opt_numeric('vcm_temp_cold_bar_tol'),
+
         'msld_samples_json'      => (function() {
             $data = [];
             $qtys = $_POST['msld_qty'] ?? [];
             $remarks = $_POST['msld_remarks'] ?? [];
+            $others_spec = sanitize_text_field($_POST['msld_others_spec'] ?? '');
             $msld_rows = [
                 "Heat pipe / HMC cases",
                 "Thermal / Electrical / RF / Thermocouple feedthrough",
                 "Shrouds / Bellows",
                 "Vacuum lines & fittings",
                 "Wave guides / Valves / Gauges",
-                "Others (Specify)"
+                "Others"
             ];
             foreach($msld_rows as $idx => $desc) {
-                $data[] = [
+                $row = [
                     'qty'     => sanitize_text_field($qtys[$idx] ?? ''),
                     'remarks' => sanitize_text_field($remarks[$idx] ?? ''),
                 ];
+                if ($desc === "Others") {
+                    $row['others_spec'] = $others_spec;
+                }
+                $data[] = $row;
             }
             return json_encode($data);
         })(),
@@ -1045,16 +1332,16 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['submit_request'])) {
             }
         }
         // ════════════════════════════════════════════════════════════════════
-        // INDENTER ROLE SUBMISSION — UPDATE or INSERT draft
+        // USER SUBMISSION (indenter / external tr_submitter / UHV staff) — UPDATE or INSERT draft
         // ════════════════════════════════════════════════════════════════════
-        else if ($user_role === 'indenter') {
+        else if (in_array($user_role, ['indenter', 'tr_submitter', 'UHV'], true)) {
             $draft_id = intval($_POST['draft_id'] ?? 0);
             
             $qa_required = sanitize_text_field($_POST['qa_exists'] ?? 'no');
             if (!in_array($qa_required, ['yes', 'no'])) {
                 $qa_required = 'no';
             }
-            $submission_status = ($qa_required === 'yes') ? 'pending_qa' : 'pending';
+            $submission_status = ($qa_required === 'yes') ? 'pending_qa' : 'pending_staff';
             
             $submit_data = [
                 'submission_date'        => date('Y-m-d H:i:s'),
@@ -1105,31 +1392,64 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['submit_request'])) {
                 'user_id'                => $user->ID,
                 'status'                 => $submission_status,
         // Multi-test type & sub-form fields
-        'test_types'             => sanitize_text_field(implode(',', array_filter(array_map('sanitize_text_field', (array)($_POST['test_types'] ?? []))))),
+        'test_types'             => sanitize_text_field(implode(', ', array_filter(array_map('sanitize_text_field', (array)($_POST['test_types'] ?? []))))),
         // Multipaction Test fields
-        'mp_package_name'       => sanitize_text_field($_POST['mp_package_name'] ?? ''),
-        'mp_package_size'       => sanitize_text_field($_POST['mp_package_size'] ?? ''),
+        'mp_package_size'       => (function() {
+            $size = [
+                'l' => sanitize_text_field($_POST['mp_package_l'] ?? ''),
+                'b' => sanitize_text_field($_POST['mp_package_b'] ?? ''),
+                'h' => sanitize_text_field($_POST['mp_package_h'] ?? ''),
+            ];
+            return json_encode($size);
+        })(),
         'mp_test_profile_attach'=> sanitize_text_field($_POST['mp_test_profile_attach'] ?? ''),
-        'mp_thermocouples'      => sanitize_text_field($_POST['mp_thermocouples'] ?? ''),
+        'mp_test_profile_file'  => (function() {
+            if (!empty($_FILES['mp_test_profile_file']['name'])) {
+                if (!function_exists('wp_handle_upload')) require_once ABSPATH . 'wp-admin/includes/file.php';
+                $upload = wp_handle_upload($_FILES['mp_test_profile_file'], ['test_form' => false]);
+                return !empty($upload['url']) ? $upload['url'] : ($_POST['mp_test_profile_file_existing'] ?? '');
+            }
+            return sanitize_text_field($_POST['mp_test_profile_file_existing'] ?? '');
+        })(),
+        'mp_thermocouples'      => max(0, intval($_POST['mp_thermocouples'] ?? 0)),
         'mp_ft_rf_qty'          => intval($_POST['mp_ft_rf_qty'] ?? 0),
         'mp_ft_elec_qty'        => intval($_POST['mp_ft_elec_qty'] ?? 0),
         'mp_ft_others_spec'     => sanitize_text_field($_POST['mp_ft_others_spec'] ?? ''),
         'mp_ft_others_qty'      => intval($_POST['mp_ft_others_qty'] ?? 0),
         'mp_special_instructions'=> sanitize_textarea_field($_POST['mp_special_instructions'] ?? ''),
         // TVC fields
-        'tvc_specimen_name'     => sanitize_text_field($_POST['tvc_specimen_name'] ?? ''),
-        'tvc_package_size'      => sanitize_text_field($_POST['tvc_package_size'] ?? ''),
-        'tvc_vacuum_range'      => sanitize_text_field($_POST['tvc_vacuum_range'] ?? ''),
+                'tvc_package_size'      => (function() {
+            $size = [
+                'l' => sanitize_text_field($_POST['tvc_package_l'] ?? ''),
+                'b' => sanitize_text_field($_POST['tvc_package_b'] ?? ''),
+                'h' => sanitize_text_field($_POST['tvc_package_h'] ?? ''),
+            ];
+            return json_encode($size);
+        })(),
+
+                'tvc_vacuum_range'      => (function() {
+            $vac = [
+                'mantissa' => sanitize_text_field($_POST['tvc_vacuum_mantissa'] ?? ''),
+                'exponent' => sanitize_text_field($_POST['tvc_vacuum_exponent'] ?? ''),
+            ];
+            return json_encode($vac);
+        })(),
+
+        
         'tvc_temp_hot'          => sanitize_text_field($_POST['tvc_temp_hot'] ?? ''),
         'tvc_temp_hot_tol'      => sanitize_text_field($_POST['tvc_temp_hot_tol'] ?? ''),
         'tvc_temp_cold'         => sanitize_text_field($_POST['tvc_temp_cold'] ?? ''),
         'tvc_temp_cold_tol'     => sanitize_text_field($_POST['tvc_temp_cold_tol'] ?? ''),
         'tvc_duration_hot'      => sanitize_text_field($_POST['tvc_duration_hot'] ?? ''),
         'tvc_duration_cold'     => sanitize_text_field($_POST['tvc_duration_cold'] ?? ''),
-        'tvc_cycles_required'   => sanitize_text_field($_POST['tvc_cycles_required'] ?? ''),
+                'tvc_cycles_required'   => intval($_POST['tvc_cycles_required'] ?? 0),
+
         'tvc_start_cycle'       => sanitize_text_field($_POST['tvc_start_cycle'] ?? ''),
-        'tvc_thermocouples'     => sanitize_text_field($_POST['tvc_thermocouples'] ?? ''),
-        'tvc_instructions'      => sanitize_textarea_field($_POST['tvc_instructions'] ?? ''),
+                'tvc_thermocouples'     => intval($_POST['tvc_thermocouples'] ?? 0),
+
+                'tvc_instructions'      => sanitize_textarea_field($_POST['tvc_instructions'] ?? ''),
+        'tvc_other_tests'       => sanitize_textarea_field($_POST['tvc_other_tests'] ?? ''),
+
         // VCM fields
         'vcm_samples_json'      => (function() {
             $data = [];
@@ -1146,11 +1466,24 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['submit_request'])) {
             }
             return json_encode($data);
         })(),
-        'vcm_vacuum_req'        => sanitize_text_field($_POST['vcm_vacuum_req'] ?? ''),
-        'vcm_duration'          => sanitize_text_field($_POST['vcm_duration'] ?? ''),
-        'vcm_samples_loaded'    => sanitize_text_field($_POST['vcm_samples_loaded'] ?? ''),
-        'vcm_temp_hot_bar'      => sanitize_text_field($_POST['vcm_temp_hot_bar'] ?? ''),
-        'vcm_temp_cold_bar'     => sanitize_text_field($_POST['vcm_temp_cold_bar'] ?? ''),
+                'vcm_vacuum_req'        => (function() {
+            $vac = [
+                'mantissa' => sanitize_text_field($_POST['vcm_vacuum_mantissa'] ?? ''),
+                'exponent' => sanitize_text_field($_POST['vcm_vacuum_exponent'] ?? ''),
+            ];
+            return json_encode($vac);
+        })(),
+
+                'vcm_duration'          => intval($_POST['vcm_duration'] ?? 0),
+
+                'vcm_samples_loaded'    => intval($_POST['vcm_samples_loaded'] ?? 0),
+
+                'vcm_temp_hot_bar'      => uhv_form_sanitize_opt_numeric('vcm_temp_hot_bar'),
+        'vcm_temp_hot_bar_tol'  => uhv_form_sanitize_opt_numeric('vcm_temp_hot_bar_tol'),
+
+                'vcm_temp_cold_bar'     => uhv_form_sanitize_opt_numeric('vcm_temp_cold_bar'),
+        'vcm_temp_cold_bar_tol' => uhv_form_sanitize_opt_numeric('vcm_temp_cold_bar_tol'),
+
         'gauge_calibration_json'=> (function() {
             $gauges = [];
             $makes = $_POST['gauge_make'] ?? [];
@@ -1209,19 +1542,24 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['submit_request'])) {
             $data = [];
             $qtys = $_POST['msld_qty'] ?? [];
             $remarks = $_POST['msld_remarks'] ?? [];
+            $others_spec = sanitize_text_field($_POST['msld_others_spec'] ?? '');
             $msld_rows = [
                 "Heat pipe / HMC cases",
                 "Thermal / Electrical / RF / Thermocouple feedthrough",
                 "Shrouds / Bellows",
                 "Vacuum lines & fittings",
                 "Wave guides / Valves / Gauges",
-                "Others (Specify)"
+                "Others"
             ];
             foreach($msld_rows as $idx => $desc) {
-                $data[] = [
+                $row = [
                     'qty'     => sanitize_text_field($qtys[$idx] ?? ''),
                     'remarks' => sanitize_text_field($remarks[$idx] ?? ''),
                 ];
+                if ($desc === "Others") {
+                    $row['others_spec'] = $others_spec;
+                }
+                $data[] = $row;
             }
             return json_encode($data);
         })(),
@@ -1284,7 +1622,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['submit_request'])) {
                 $tr_no = 'REQ' . str_pad($final_id, 5, '0', STR_PAD_LEFT);
                 $wpdb->update($table, ['test_requisition_no' => $tr_no], ['id' => $final_id]);
                 
-                uhv_log_history($wpdb, $final_id, 'Form Submitted', 'draft_indenter', $submission_status, $emp->name, $emp->stno, 'indenter', $is_resubmit ? 'Form resubmitted after rejection/recheck' : '');
+                uhv_log_history($wpdb, $final_id, 'Form Submitted', 'draft_indenter', $submission_status, $emp->name, $emp->stno, $user_role, $is_resubmit ? 'Form resubmitted after rejection/recheck' : '');
 
                 if ($submission_status === 'pending_qa') {
                     uhv_notify_qa($wpdb, $tr_no, $emp->name, $submit_data['qa_stno'] ?? '');
@@ -1303,7 +1641,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['submit_request'])) {
     // If we reach here, there were errors
     if (!empty($errors)) {
         set_transient('uhv_errors_'.$user->ID, $errors, 60);
-        wp_redirect(add_query_arg('mgr_action', 'create_new', add_query_arg('uhv_msg', 'error', get_permalink())));
+        if ($user_role === 'manager') {
+            wp_redirect(add_query_arg(['mgr_action' => 'create_new', 'uhv_msg' => 'error'], get_permalink()));
+        } else {
+            wp_redirect(add_query_arg(['action' => 'create_new', 'uhv_msg' => 'error'], get_permalink()));
+        }
         exit;
     }
 }
@@ -1324,6 +1666,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['qa_decision'])) {
     }
     if (!$is_qa_authorised) wp_die('Unauthorized');
     $decision   = ($_POST['qa_decision'] === 'accept') ? 'accept' : 'reject';
+    // Overhaul: QA Acceptance now forwards to STAFF (pending_staff) instead of directly to manager
     $new_status = ($decision === 'accept') ? 'pending_staff' : 'qa_rejected';
     $wpdb->update($table, [
         'status'           => $new_status,
@@ -1334,11 +1677,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['qa_decision'])) {
     ], ['id' => $form_id]);
     $form = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $form_id));
     if ($decision === 'accept') {
-        uhv_log_history($wpdb, $form_id, 'QA Accepted', 'pending_qa', 'pending', $emp->name, $emp->stno, 'qa', sanitize_textarea_field($_POST['qa_remarks'] ?? ''));
+        uhv_log_history($wpdb, $form_id, 'QA Accepted', 'pending_qa', 'pending_staff', $emp->name, $emp->stno, 'qa', sanitize_textarea_field($_POST['qa_remarks'] ?? ''));
         uhv_notify_managers($wpdb, $form->test_requisition_no, $emp->name);
     } else {
         uhv_log_history($wpdb, $form_id, 'QA Rejected', 'pending_qa', 'qa_rejected', $emp->name, $emp->stno, 'qa', sanitize_textarea_field($_POST['qa_remarks'] ?? ''));
-        uhv_notify_indenter($form);
+        uhv_notify_user($form);
     }
     $msg = ($decision === 'accept') ? 'qa_accepted' : 'qa_rejected';
     // Redirect: manager/deputy → back to their QA review tab; others → their dashboard
@@ -1351,6 +1694,122 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['qa_decision'])) {
             remove_query_arg(['qa_view', 'view_id', 'complete_id'], get_permalink())
         ));
     }
+    exit;
+}
+
+
+/* ---------- STAFF REVIEW (PHASE 1) ---------- */
+if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['staff_review_action'])) {
+    error_log('UHV: staff_review_action triggered. Action: ' . ($_POST['staff_review_action'] ?? 'none') . ' | Marker: ' . ($_POST['uhv_staff_form_marker'] ?? 'none'));
+    
+    $uhv_can_staff = (
+        $user_role === 'UHV'
+        || $user_role === 'manager'
+        || (in_array($user_role, ['indenter', 'tr_submitter'], true) && !empty($GLOBALS['is_uhv_section_person']))
+    );
+    if (!$uhv_can_staff) {
+        error_log("UHV Error: Unauthorized staff action by role: $user_role");
+        wp_die('Unauthorized: You do not have permission.');
+    }
+    
+    if (!wp_verify_nonce($_POST['uhv_nonce'],'uhv_action')) {
+        error_log('UHV Error: Nonce verification failed');
+        wp_die('Security check failed. Please refresh the page and try again.');
+    }
+
+    $form_id = intval($_POST['form_id'] ?? 0);
+    $action = sanitize_text_field($_POST['staff_review_action'] ?? '');
+    $form = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $form_id));
+    if (!$form) {
+        error_log("UHV Error: Form ID $form_id not found");
+        wp_die('Invalid form ID');
+    }
+    
+    // Accept either review status OR even pending_manager (to allow edits/resubmission if needed)
+    $allowed_statuses = ['pending_staff', 'recheck_staff', 'pending_manager', 'recheck_indenter'];
+    if (!in_array($form->status, $allowed_statuses)) {
+        error_log("UHV Error: Invalid request state. TR {$form->test_requisition_no} is in status: {$form->status}");
+        wp_die('Invalid request state: Current status is ' . $form->status);
+    }
+
+    // Extract common risk data for both forward and recheck
+    $tests = uhv_get_selected_test_labels($form);
+    $risk_data_indexed = [];
+    $errors = [];
+    foreach ($tests as $idx => $label) {
+        $accepted = strtolower(sanitize_text_field($_POST['risk_test_object_accepted'][$idx] ?? ''));
+        $risk_as  = strtolower(sanitize_text_field($_POST['risk_assessed_uhv'][$idx] ?? ''));
+        $rpn      = sanitize_text_field($_POST['rpn_uhv'][$idx] ?? '');
+        $record   = strtolower(sanitize_text_field($_POST['risk_record_uhv'][$idx] ?? ''));
+        
+        $risk_table_url = $_POST['existing_risk_table_url'][$idx] ?? '';
+        $file_key = 'risk_table_file_' . $idx;
+        if (!empty($_FILES[$file_key]['name'])) {
+            if (!function_exists('wp_handle_upload')) require_once ABSPATH . 'wp-admin/includes/file.php';
+            $upload = wp_handle_upload($_FILES[$file_key], ['test_form' => false]);
+            if (!empty($upload['url'])) {
+                $risk_table_url = $upload['url'];
+            }
+        }
+
+        // Only validate if forwarding to manager
+        if ($action === 'forward_manager') {
+            if (!in_array($accepted, ['yes','no'])) $errors[] = "{$label}: Test request accepted is required";
+            if (!in_array($risk_as, ['yes','no'])) $errors[] = "{$label}: Risk assessed is required";
+            if (!in_array($rpn, ['lt4','gte5'])) $errors[] = "{$label}: RPN is required";
+            if (!in_array($record, ['yes','no','na'])) $errors[] = "{$label}: Risk record is required";
+        }
+        
+        $risk_data_indexed[] = [
+            'test_label'           => $label,
+            'test_object_accepted' => ucfirst($accepted),
+            'risk_assessed_uhv'    => ucfirst($risk_as),
+            'rpn_uhv'              => $rpn,
+            'risk_record_uhv'      => $record,
+            'risk_table_url'       => $risk_table_url,
+        ];
+    }
+    $risk_json_str = wp_json_encode($risk_data_indexed);
+    $comment = sanitize_textarea_field($_POST['staff_review_comment'] ?? '');
+
+    if ($action === 'recheck_indenter') {
+        if (empty($comment)) {
+            // Recheck requires a comment/instruction for the user
+            set_transient('uhv_errors_'.$user->ID, ['Recheck Instructions are required — please enter a comment for the user.'], 60);
+            $redirect_url = add_query_arg(['complete_id'=> $form_id, 'uhv_msg'=>'validation_error'], get_permalink());
+            wp_redirect($redirect_url);
+            exit;
+        }
+        $wpdb->update($table, [
+            'status'             => 'recheck_indenter',
+            'manager_comment'    => $comment,
+            'per_test_risk_json' => $risk_json_str
+        ], ['id' => $form_id]);
+        uhv_log_history($wpdb, $form_id, 'Staff Sent for Recheck', $form->status, 'recheck_indenter', $emp->name, $emp->stno, 'staff', $comment);
+        wp_redirect(add_query_arg('uhv_msg', 'recheck_sent', remove_query_arg(['view_id','complete_id'], get_permalink())));
+        exit;
+    }
+
+    // forward_manager — validate all fields are filled
+    if (!empty($errors)) {
+        error_log('UHV Validation Errors (forward_manager): ' . implode(', ', $errors));
+        // Save progress anyway so staff don't lose their selections
+        $wpdb->update($table, ['per_test_risk_json' => $risk_json_str], ['id' => $form_id]);
+        set_transient('uhv_errors_'.$user->ID, $errors, 60);
+        $redirect_url = add_query_arg(['complete_id'=> $form_id, 'uhv_msg'=>'validation_error'], get_permalink());
+        wp_redirect($redirect_url);
+        exit;
+    }
+
+    $wpdb->update($table, [
+        'per_test_risk_json' => $risk_json_str,
+        'manager_comment'    => $comment,
+        'status'             => 'pending_manager',
+        'staff_review_date'  => current_time('mysql'),
+        'reviewed_by'        => esc_html($emp->name),
+    ], ['id' => $form_id]);
+    uhv_log_history($wpdb, $form_id, 'Staff Review Completed', $form->status, 'pending_manager', $emp->name, $emp->stno, 'staff', 'Risk assessment forwarded to manager');
+    wp_redirect(add_query_arg('uhv_msg', 'staff_reviewed', remove_query_arg(['complete_id','view_id'], get_permalink())));
     exit;
 }
 
@@ -1375,40 +1834,16 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['action_type'])) {
         }
 
         if ($action_raw === 'approve') {
-            $errors = [];
-            $risk_as = sanitize_text_field($_POST['risk_assessed_uhv'] ?? '');
-            $rpn     = sanitize_text_field($_POST['rpn_uhv'] ?? '');
-            $risk_rec_uhv = sanitize_text_field($_POST['risk_record_uhv'] ?? '');
-            $test_oa = sanitize_text_field($_POST['test_object_accepted'] ?? '');
+            $comment = sanitize_textarea_field($_POST['manager_comment'] ?? '');
             
-            if (empty($risk_as)) $errors[] = "Pre-Test Assessment: Risk Assessed is required.";
-            if (!in_array($rpn, ['lt4', 'gte5'])) $errors[] = "Pre-Test Assessment: Risk Priority Number (RPN) range must be selected.";
-            if (empty($risk_rec_uhv)) $errors[] = "Pre-Test Assessment: Risk Record (Yes/No/NA) is required.";
-            if ($rpn === 'gte5' && empty($_FILES['risk_assessment_file']['name'])) {
-                // Allow if a file was previously uploaded
-                $prev_file = $wpdb->get_var($wpdb->prepare("SELECT risk_form_file FROM {$table} WHERE id=%d", $form_id));
-                if (empty($prev_file)) $errors[] = "Pre-Test Assessment: Risk Assessment File is required when RPN ≥ 5.";
-            }
-            if (empty($test_oa)) $errors[] = "Pre-Test Assessment: Test request received, reviewed and accepted for testing is required.";
-            
-            if (!empty($errors)) {
-                set_transient('uhv_errors_'.$user->ID, $errors, 60);
-                wp_redirect(add_query_arg(['view_id'=>$form_id, 'uhv_msg'=>'validation_error'], get_permalink()));
-                exit;
-            }
-
-            // Handle risk assessment file upload (only when RPN >= 5)
+            // Overhaul: Manager no longer fills Section A. We just approve.
+            // Manager may still upload a file if they wish to attach a formal approval record.
             $risk_file_url = $wpdb->get_var($wpdb->prepare("SELECT risk_form_file FROM {$table} WHERE id=%d", $form_id));
-            if ($rpn === 'gte5' && !empty($_FILES['risk_assessment_file']['name'])) {
+            if (!empty($_FILES['risk_assessment_file']['name'])) {
                 if (!function_exists('wp_handle_upload')) require_once ABSPATH . 'wp-admin/includes/file.php';
                 $upload = wp_handle_upload($_FILES['risk_assessment_file'], ['test_form' => false]);
                 if (!empty($upload['url'])) {
                     $risk_file_url = $upload['url'];
-                } else {
-                    $errors[] = 'File upload failed: ' . ($upload['error'] ?? 'Unknown error');
-                    set_transient('uhv_errors_'.$user->ID, $errors, 60);
-                    wp_redirect(add_query_arg(['view_id'=>$form_id, 'uhv_msg'=>'validation_error'], get_permalink()));
-                    exit;
                 }
             }
 
@@ -1420,28 +1855,39 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['action_type'])) {
                 'reviewed_by'          => esc_html($emp->name),
                 'approval_date'        => date('Y-m-d H:i:s'),
                 'manager_decision_date'=> date('Y-m-d H:i:s'),
-                'risk_assessed_uhv'        => $risk_as,
-                'rpn_uhv'                  => $rpn,
-                'risk_record_uhv'          => $risk_rec_uhv,
-                'risk_form_file'            => $risk_file_url,
-                'test_object_accepted'      => $test_oa,
-                'risk_record_uhv'           => sanitize_text_field($_POST['risk_record_uhv'] ?? ''),
+                'risk_form_file'       => $risk_file_url,
             ], ['id' => $form_id]);
 
-            uhv_log_history($wpdb, $form_id, 'Manager Approved', 'pending', 'approved', $emp->name, $emp->stno, 'manager', $comment);
+            uhv_log_history($wpdb, $form_id, 'Manager Approved', 'pending_manager', 'approved', $emp->name, $emp->stno, 'manager', $comment);
             if ($wpdb->last_error) {
                 error_log('UHV Manager approve DB error: ' . $wpdb->last_error);
             }
             
-            // Assign TR number — standardized to REQXXXXX
+            // Assign Final TR number: YYYY_MM_UHV_XXXXX (Sequential)
             $cur_tr = $wpdb->get_var($wpdb->prepare("SELECT test_requisition_no FROM {$table} WHERE id=%d", $form_id));
-            if ($cur_tr && preg_match('/^(DRAFT|PENDING)-/', $cur_tr)) {
-                $tr_no = 'REQ' . str_pad($form_id, 5, '0', STR_PAD_LEFT);
+            if ($cur_tr && preg_match('/^(DRAFT|PENDING|REQ)/', $cur_tr)) {
+                $prefix = date('Y-m') . '_UHV_';
+                // Find the highest sequence number for the current month's prefix
+                $last_tr = $wpdb->get_var($wpdb->prepare(
+                    "SELECT test_requisition_no FROM {$table} 
+                     WHERE test_requisition_no LIKE %s 
+                     ORDER BY test_requisition_no DESC LIMIT 1",
+                    $prefix . '%'
+                ));
+
+                $next_seq = 1;
+                if ($last_tr) {
+                    $parts = explode('_', $last_tr);
+                    $last_seq = intval(end($parts));
+                    $next_seq = $last_seq + 1;
+                }
+
+                $tr_no = $prefix . str_pad($next_seq, 6, '0', STR_PAD_LEFT); // User requested 000001 (6 digits) in example 
                 $wpdb->query($wpdb->prepare("UPDATE {$table} SET test_requisition_no = %s WHERE id = %d", $tr_no, $form_id));
-                if ($wpdb->last_error) error_log('UHV approve TR error: ' . $wpdb->last_error);
+                if ($wpdb->last_error) error_log('UHV approve TR format error: ' . $wpdb->last_error);
             }
             $form = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $form_id));
-            uhv_notify_indenter($form);
+            uhv_notify_user($form);
             uhv_notify_uhv($wpdb, $form);
             
             wp_redirect(add_query_arg('uhv_msg', 'approved', remove_query_arg(['view_id','mgr_step'], get_permalink())));
@@ -1457,9 +1903,9 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['action_type'])) {
                 'approval_date'        => date('Y-m-d H:i:s'),
                 'manager_decision_date'=> date('Y-m-d H:i:s'),
             ], ['id' => $form_id]);
-            uhv_log_history($wpdb, $form_id, 'Manager Rejected', 'pending', 'rejected', $emp->name, $emp->stno, 'manager', $comment);
+            uhv_log_history($wpdb, $form_id, 'Manager Rejected', 'pending_manager', 'rejected', $emp->name, $emp->stno, 'manager', $comment);
             $form = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $form_id));
-            uhv_notify_indenter($form);
+            uhv_notify_user($form);
             wp_redirect(add_query_arg('uhv_msg','rejected', remove_query_arg(['view_id'], get_permalink())));
             exit;
 
@@ -1467,15 +1913,15 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['action_type'])) {
             // Send back to indenter for correction — use dedicated 'recheck_indenter' status
             // so it appears separately from plain drafts in the indenter dashboard
             $wpdb->update($table, [
-                'status'               => 'recheck_indenter',
+                'status'               => 'pending_staff',
                 'manager_action'       => 'recheck',
                 'manager_comment'      => $comment,
                 'reviewed_by'          => esc_html($emp->name),
                 'manager_decision_date'=> date('Y-m-d H:i:s'),
             ], ['id' => $form_id]);
-            uhv_log_history($wpdb, $form_id, 'Manager Sent for Recheck', 'pending', 'recheck_indenter', $emp->name, $emp->stno, 'manager', $comment);
+            uhv_log_history($wpdb, $form_id, 'Manager Sent for Recheck', 'pending_manager', 'pending_staff', $emp->name, $emp->stno, 'manager', $comment);
             $form = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $form_id));
-            uhv_notify_indenter($form);
+            uhv_notify_user($form);
             wp_redirect(add_query_arg('uhv_msg','recheck_sent', remove_query_arg(['view_id'], get_permalink())));
             exit;
         }
@@ -1504,8 +1950,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['save_draft'])) {
     }
     
     // Validate Yes/No fields format
-    $yes_no_fields = ['risk_assessed_uhv', 'risk_form_filled', 'special_processes', 
-                      'test_received_reviewed', 'test_object_accepted', 'test_on_time'];
+    $yes_no_fields = ['test_on_time'];
     
     foreach ($yes_no_fields as $field) {
         $value = strtolower(trim($_POST[$field] ?? ''));
@@ -1561,6 +2006,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['save_draft'])) {
         'test_completed_datetime'       => str_replace('T', ' ', sanitize_text_field($_POST['test_completed_datetime'] ?? '')),
         'test_duration'                 => $test_duration,
         'test_on_time'                  => strtolower(trim($_POST['test_on_time'] ?? '')) === 'yes' ? 'Yes' : (trim($_POST['test_on_time'] ?? '') === '' ? '' : 'No'),
+        'test_code'                     => sanitize_text_field($_POST['test_code'] ?? ''),
         'specimen_collected_by_name'    => $specimen_name,
         'specimen_collected_by_sig'     => $specimen_sig,
         'verification_closed_by_name'   => $verify_name,
@@ -1569,8 +2015,42 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['save_draft'])) {
         'draft_saved_by'                => $emp->name,
     ];
     
+    // NEW: Also save Section A (per-test risk) if we are in Phase 1 or just want to persist it
+    if (isset($_POST['uhv_staff_form_marker'])) {
+        $form_raw = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $form_id));
+        if ($form_raw) {
+            $testsArr = uhv_get_selected_test_labels($form_raw);
+            $risk_data_collect = [];
+            foreach ($testsArr as $idx => $label) {
+                $accepted = strtolower(sanitize_text_field($_POST['risk_test_object_accepted'][$idx] ?? ''));
+                $risk_as  = strtolower(sanitize_text_field($_POST['risk_assessed_uhv'][$idx] ?? ''));
+                $rpn      = sanitize_text_field($_POST['rpn_uhv'][$idx] ?? '');
+                $record   = strtolower(sanitize_text_field($_POST['risk_record_uhv'][$idx] ?? ''));
+                
+                $risk_table_url = $_POST['existing_risk_table_url'][$idx] ?? '';
+                $file_key = 'risk_table_file_' . $idx;
+                if (!empty($_FILES[$file_key]['name'])) {
+                    if (!function_exists('wp_handle_upload')) require_once ABSPATH . 'wp-admin/includes/file.php';
+                    $upload = wp_handle_upload($_FILES[$file_key], ['test_form' => false]);
+                    if (!empty($upload['url'])) $risk_table_url = $upload['url'];
+                }
+
+                $risk_data_collect[] = [
+                    'test_label'           => $label,
+                    'test_object_accepted' => ucfirst($accepted),
+                    'risk_assessed_uhv'    => ucfirst($risk_as),
+                    'rpn_uhv'              => $rpn,
+                    'risk_record_uhv'      => $record,
+                    'risk_table_url'       => $risk_table_url,
+                ];
+            }
+            $update_data['per_test_risk_json'] = wp_json_encode($risk_data_collect);
+            $update_data['manager_comment']    = sanitize_textarea_field($_POST['staff_review_comment'] ?? '');
+        }
+    }
+    
     $wpdb->update($table, $update_data, ['id'=>$form_id]);
-    uhv_log_history($wpdb, $form_id, 'Draft Saved', 'approved', 'approved', $emp->name, $emp->stno, 'staff', 'Staff form draft saved');
+    uhv_log_history($wpdb, $form_id, 'Draft Saved', 'any', 'any', $emp->name, $emp->stno, 'staff', 'Staff form draft saved (including Section A if applicable)');
     
     wp_redirect(add_query_arg('uhv_msg', 'uhv_draft_saved', remove_query_arg(['action','complete_id','view_id'], get_permalink())));
     exit;
@@ -1586,8 +2066,6 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['complete_uhv'])) {
     
     // ===== MANDATORY FIELD VALIDATION =====
     $mandatory_fields = [
-        'requisition_received_date' => 'Requisition Received Date',
-        'risk_assessed_uhv' => 'Risk Assessed (Yes/No)',
         'test_started_datetime' => 'Test Started Date/Time',
         'test_completed_datetime' => 'Test Completed Date/Time',
         'specimen_collected_by_name' => 'Specimen Collected by Name',
@@ -1615,22 +2093,13 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['complete_uhv'])) {
     }
     
     // ===== YES/NO FIELD VALIDATION =====
-    $yes_no_fields = ['risk_assessed_uhv', 'risk_form_filled', 'special_processes', 
-                      'test_received_reviewed', 'test_object_accepted', 'test_on_time'];
+    $yes_no_fields = ['test_on_time']; // Only test_on_time remains for staff execution
     
     foreach ($yes_no_fields as $field) {
         $value = strtolower(trim($_POST[$field] ?? ''));
         if ($value && $value !== 'yes' && $value !== 'no') {
             $errors[] = ucfirst(str_replace('_', ' ', $field)) . ': Please enter "Yes" or "No"';
         }
-    }
-    
-    // ===== RPN >= 5 REQUIRES RISK ASSESSMENT FORM = "Yes" =====
-    $rpn_post_val = trim($_POST['rpn_uhv'] ?? '');
-    $risk_form_filled = strtolower(trim($_POST['risk_form_filled'] ?? ''));
-    
-    if ($rpn_post_val === 'gte5' && $risk_form_filled !== 'yes') {
-        $errors[] = 'IMPORTANT: If RPN ≥ 5, Risk Assessment Form MUST be marked "Yes"';
     }
     
     // Show validation errors if any
@@ -1682,6 +2151,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['complete_uhv'])) {
         'test_completed_datetime'       => str_replace('T', ' ', sanitize_text_field($_POST['test_completed_datetime'] ?? '')),
         'test_duration'                 => $test_duration,
         'test_on_time'                  => strtolower(trim($_POST['test_on_time'] ?? '')) === 'yes' ? 'Yes' : 'No',
+        'test_code'                     => sanitize_text_field($_POST['test_code'] ?? ''),
         'specimen_collected_by_name'    => $specimen_name,
         'specimen_collected_by_sig'     => $specimen_sig,
         'verification_closed_by_name'   => $verify_name,
@@ -1689,6 +2159,49 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['complete_uhv'])) {
         'status'                        => 'completed',
         'completion_date'               => date('Y-m-d H:i:s'),
     ];
+
+    // Collect Bombing staff data if applicable
+    $req_obj = $wpdb->get_row($wpdb->prepare("SELECT test_types FROM {$table} WHERE id=%d", $form_id));
+    if ($req_obj && stripos($req_obj->test_types ?? '', 'Bombing') !== false) {
+        $blu = [];
+        $bnm  = $_POST['bombing_load_name'] ?? [];
+        if (!empty($bnm)) {
+            $brcv = $_POST['bombing_load_received_on'] ?? [];
+            $bqty = $_POST['bombing_load_qty'] ?? [];
+            $bprs = $_POST['bombing_load_pressure'] ?? [];
+            $bchm = $_POST['bombing_load_chamber'] ?? [];
+            $bdur = $_POST['bombing_load_duration'] ?? [];
+            $bon  = $_POST['bombing_load_on'] ?? [];
+            for($i=0; $i<count($bnm); $i++) {
+                if(!empty($bnm[$i])) {
+                    $blu[] = [
+                        'received_on' => sanitize_text_field($brcv[$i]??''),
+                        'name'        => sanitize_text_field($bnm[$i]??''),
+                        'qty'         => sanitize_text_field($bqty[$i]??''),
+                        'pressure'    => sanitize_text_field($bprs[$i]??''),
+                        'chamber'     => sanitize_text_field($bchm[$i]??''),
+                        'duration'    => sanitize_text_field($bdur[$i]??''),
+                        'on'          => sanitize_text_field($bon[$i]??''),
+                    ];
+                }
+            }
+        }
+        $bombing_staff_data = [
+            'checklist' => (array)($_POST['bombing_checklist'] ?? []),
+            'loading_unloading' => $blu,
+            'loaded_by' => sanitize_text_field($_POST['bombing_loaded_by'] ?? ''),
+            'unloaded_by' => sanitize_text_field($_POST['bombing_unloaded_by'] ?? ''),
+            'msld' => [
+                'calibrated' => sanitize_text_field($_POST['bombing_msld_calibrated'] ?? ''),
+                'used'       => (array)($_POST['bombing_msld_used'] ?? []),
+                'started'    => sanitize_text_field($_POST['bombing_msld_started'] ?? ''),
+                'ended'      => sanitize_text_field($_POST['bombing_msld_ended'] ?? ''),
+                'staff'      => sanitize_text_field($_POST['bombing_msld_staff'] ?? ''),
+                'sig'        => sanitize_text_field($_POST['bombing_msld_sig'] ?? ''),
+            ]
+        ];
+        $update_data['bombing_staff_json'] = json_encode($bombing_staff_data);
+    }
     
     $wpdb->update($table, $update_data, ['id'=>$form_id]);
     uhv_log_history($wpdb, $form_id, 'Test Completed', 'approved', 'completed', $emp->name, $emp->stno, 'staff', 'UHV Test form completed and closed');
@@ -1774,7 +2287,7 @@ textarea{width:100%;min-height:110px;border:1px solid #000;resize:vertical;paddi
 .list-table tbody tr:hover{background:#f8f9fa}
 .draft-notice{background:#fff3cd;border:2px solid #ffc107;padding:18px 24px;margin:25px 0;border-radius:6px;font-size:16px;}
 .qa_field{display:none;}
-.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:25px;margin-bottom:45px}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));gap:25px;margin-bottom:45px}
 .stat-card{padding:32px 28px;border:3px solid;text-align:center;border-radius:12px;box-shadow:0 4px 8px rgba(0,0,0,0.05);transition:all .3s;}
 .stat-card:hover{transform:translateY(-3px);box-shadow:0 8px 16px rgba(0,0,0,0.1);}
 .stat-card .stat-num{font-size:54px;font-weight:800;line-height:1;margin-bottom:10px}
@@ -1810,6 +2323,14 @@ function uhv_request_form($emp, $draft=null, $ajax_url='') {
     $resubmit         = (!empty($d->status) && $d->status === 'rejected');           // manager rejected — partial lock
     $qa_rejected_edit = (!empty($d->status) && $d->status === 'qa_rejected');         // qa rejected — all editable
     $recheck_edit     = (!empty($d->status) && $d->status === 'recheck_indenter');    // manager sent for recheck — all editable
+    
+    // Parse Multipaction package size
+    $mp_size = ['l'=>'', 'b'=>'', 'h'=>''];
+    if (!empty($d->mp_package_size)) {
+        $tmp = json_decode($d->mp_package_size, true);
+        if (is_array($tmp)) $mp_size = array_merge($mp_size, $tmp);
+    }
+
     $ro       = $resubmit ? 'readonly' : '';
     $ro_bg    = $resubmit ? 'background:#f5f5f5;' : '';
 ?>
@@ -1856,7 +2377,7 @@ function uhv_request_form($emp, $draft=null, $ajax_url='') {
 <?php endif; ?>
 
 <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:30px;font-size:18px;">
-  <div><strong style="font-size:17px;">UHV LAB</strong><br>ENVIRONMENTAL TEST FACILITY<br><strong>ISITE</strong></div>
+  <div><strong style="font-size:17px;">UHV LAB</strong><br>ENVIRONMENTAL TEST FACILITY<br><strong>U R Rao Satellite Centre</strong></div>
   <div style="text-align:right">
     <strong style="font-size:17px;">TEST REQUEST FORM</strong><br>UHV<br><br>
     <span style="font-size:17px;color:#856404;background:#fff3cd;border:1px solid #ffc107;padding:6px 14px;display:inline-block;border-radius:4px;">
@@ -1947,7 +2468,7 @@ $qa_search_display = (strtolower($qa_exists_val) === 'yes') ? 'block' : 'none';
 
 <!-- ── TEST OBJECT DETAILS (locked in resubmit mode) ── -->
 <?php
-$saved_types = array_filter(explode(',', $d->test_types ?? ''));
+$saved_types = array_filter(array_map('trim', explode(',', $d->test_types ?? '')));
 $mp_checked  = in_array('Multipaction Test', $saved_types) ? 'checked' : '';
 $tvc_checked = in_array('Thermal Vacuum Cycling Test', $saved_types) ? 'checked' : '';
 $vcm_checked = in_array('VCM (Outgassing) Testing Material', $saved_types) ? 'checked' : '';
@@ -1970,7 +2491,7 @@ $bombing_checked = in_array('Bombing & Fine Leak Detection of Electronic Compone
   <td colspan="3"><input type="date" class="block" name="test_required_on" value="<?php echo esc_attr($d->test_required_on ?? ''); ?>" <?php echo $ro; ?> style="<?php echo $ro_bg; ?>max-width:220px;" required></td>
 </tr>
 <tr>
-  <th style="vertical-align:top;padding-top:12px;">Type of Test <span style="color:#dc3545;">*</span><br><small style="font-weight:400;color:#666;">(Select all that apply)</small></th>
+  <th style="vertical-align:top;padding-top:12px;">Type of Test <span style="color:#dc3545;">*</span><br><small style="font-weight:400;color:#666;">(Select only one)</small></th>
   <td colspan="3" style="padding:12px 10px;">
     <?php if ($resubmit): ?>
       <!-- Manager-rejected: lock test type -->
@@ -1982,32 +2503,32 @@ $bombing_checked = in_array('Bombing & Fine Leak Detection of Electronic Compone
     <?php else: ?>
     <div style="display:flex;gap:30px;flex-wrap:wrap;">
       <label class="uniform-check-label">
-        <input type="checkbox" class="uniform-check-input" name="test_types[]" value="Multipaction Test" id="tt_mp" <?php echo $mp_checked; ?>
+        <input type="radio" class="uniform-check-input" name="test_types[]" value="Multipaction Test" id="tt_mp" <?php echo $mp_checked; ?>
                onchange="uhvToggleTestForm()">
         Multipaction Test
       </label>
       <label class="uniform-check-label">
-        <input type="checkbox" class="uniform-check-input" name="test_types[]" value="Thermal Vacuum Cycling Test" id="tt_tvc" <?php echo $tvc_checked; ?>
+        <input type="radio" class="uniform-check-input" name="test_types[]" value="Thermal Vacuum Cycling Test" id="tt_tvc" <?php echo $tvc_checked; ?>
                onchange="uhvToggleTestForm()">
         Thermal Vacuum Cycling Test
       </label>
       <label class="uniform-check-label">
-        <input type="checkbox" class="uniform-check-input" name="test_types[]" value="VCM (Outgassing) Testing Material" id="tt_vcm" <?php echo $vcm_checked; ?>
+        <input type="radio" class="uniform-check-input" name="test_types[]" value="VCM (Outgassing) Testing Material" id="tt_vcm" <?php echo $vcm_checked; ?>
                onchange="uhvToggleTestForm()">
         VCM (Outgassing) Testing Material
       </label>
       <label class="uniform-check-label">
-        <input type="checkbox" class="uniform-check-input" name="test_types[]" value="Leak Test of Vac. Elements using MSLD" id="tt_msld" <?php echo $msld_checked; ?>
+        <input type="radio" class="uniform-check-input" name="test_types[]" value="Leak Test of Vac. Elements using MSLD" id="tt_msld" <?php echo $msld_checked; ?>
                onchange="uhvToggleTestForm()">
         Leak Test of Vac. Elements using MSLD
       </label>
       <label class="uniform-check-label">
-        <input type="checkbox" class="uniform-check-input" name="test_types[]" value="Calibration of Vacuum Gauges" id="tt_gauge" <?php echo $gauge_checked; ?>
+        <input type="radio" class="uniform-check-input" name="test_types[]" value="Calibration of Vacuum Gauges" id="tt_gauge" <?php echo $gauge_checked; ?>
                onchange="uhvToggleTestForm()">
         Calibration of Vacuum Gauges
       </label>
       <label class="uniform-check-label">
-        <input type="checkbox" class="uniform-check-input" name="test_types[]" value="Bombing & Fine Leak Detection of Electronic Components" id="tt_bombing" <?php echo $bombing_checked; ?>
+        <input type="radio" class="uniform-check-input" name="test_types[]" value="Bombing & Fine Leak Detection of Electronic Components" id="tt_bombing" <?php echo $bombing_checked; ?>
                onchange="uhvToggleTestForm()">
         Bombing & Fine Leak Detection of Electronic Components
       </label>
@@ -2031,49 +2552,59 @@ $bombing_checked = in_array('Bombing & Fine Leak Detection of Electronic Compone
   <div style="padding:16px;">
   <table style="width:100%;border-collapse:collapse;">
     <tr>
-      <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;width:40%;">Name of the Package</td>
-      <td style="border:1px solid #000;padding:8px 12px;"><input class="block" name="mp_package_name" value="<?php echo esc_attr($d->mp_package_name ?? ''); ?>" <?php echo $ro; ?> style="<?php echo $ro_bg; ?>"></td>
-    </tr>
-    <tr>
-      <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;">Size of package (L x B x H) in mm</td>
-      <td style="border:1px solid #000;padding:8px 12px;"><input class="block" name="mp_package_size" value="<?php echo esc_attr($d->mp_package_size ?? ''); ?>" <?php echo $ro; ?> style="<?php echo $ro_bg; ?>"></td>
+      <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;width:40%;">Size of package (L x B x H)</td>
+      <td style="border:1px solid #000;padding:8px 12px;">
+        <div style="display:flex;gap:10px;align-items:center;">
+          <input type="number" step="any" min="0" placeholder="L" name="mp_package_l" value="<?php echo esc_attr($mp_size['l']); ?>" <?php echo $ro; ?> style="width:70px;padding:4px;<?php echo $ro_bg; ?>"> mm &times;
+          <input type="number" step="any" min="0" placeholder="B" name="mp_package_b" value="<?php echo esc_attr($mp_size['b']); ?>" <?php echo $ro; ?> style="width:70px;padding:4px;<?php echo $ro_bg; ?>"> mm &times;
+          <input type="number" step="any" min="0" placeholder="H" name="mp_package_h" value="<?php echo esc_attr($mp_size['h']); ?>" <?php echo $ro; ?> style="width:70px;padding:4px;<?php echo $ro_bg; ?>"> mm
+        </div>
+      </td>
     </tr>
     <tr>
       <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;">Attach Test Profile of vacuum requirement &amp; Test duration</td>
       <td style="border:1px solid #000;padding:8px 12px;">
-        <select name="mp_test_profile_attach" class="block" <?php echo $ro ? 'disabled' : ''; ?> style="<?php echo $ro_bg; ?>padding:5px;">
+        <select name="mp_test_profile_attach" class="block" <?php echo $ro ? 'disabled' : ''; ?> style="<?php echo $ro_bg; ?>padding:5px;" onchange="uhvToggleMPProfileUpload()">
           <option value="">-- Select --</option>
           <option value="Yes" <?php echo (($d->mp_test_profile_attach??'')==='Yes')?'selected':''; ?>>Yes</option>
           <option value="No" <?php echo (($d->mp_test_profile_attach??'')==='No')?'selected':''; ?>>No</option>
           <option value="Not Applicable" <?php echo (($d->mp_test_profile_attach??'')==='Not Applicable')?'selected':''; ?>>Not Applicable</option>
         </select>
+        <div id="mp_profile_upload_div" style="margin-top:10px; display:<?php echo (($d->mp_test_profile_attach??'')==='Yes')?'block':'none'; ?>;">
+          <input type="file" name="mp_test_profile_file" accept=".pdf" <?php echo $ro; ?>>
+          <?php if (!empty($d->mp_test_profile_file)): ?>
+            <div style="margin-top:5px;"><small>Existing: <a href="<?php echo esc_url($d->mp_test_profile_file); ?>" target="_blank">View PDF</a></small></div>
+            <input type="hidden" name="mp_test_profile_file_existing" value="<?php echo esc_attr($d->mp_test_profile_file); ?>">
+          <?php endif; ?>
+        </div>
       </td>
     </tr>
-    <tr>
       <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;">No. of "T" type Thermocouples if required</td>
-      <td style="border:1px solid #000;padding:8px 12px;"><input class="block" name="mp_thermocouples" value="<?php echo esc_attr($d->mp_thermocouples ?? ''); ?>" <?php echo $ro; ?> style="<?php echo $ro_bg; ?>"></td>
-    </tr>
+      <td style="border:1px solid #000;padding:8px 12px;"><input type="number" min="0" class="block" name="mp_thermocouples" value="<?php echo esc_attr($d->mp_thermocouples ?? ''); ?>" <?php echo $ro; ?> style="border:1px solid #ccc;padding:5px;background:#fff;<?php echo $ro_bg; ?>"></td>
     <tr>
       <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;">Feedthroughs needed (Qty):</td>
       <td style="border:1px solid #000;padding:8px 12px;">
         <div style="display:flex;gap:15px;align-items:center;margin-bottom:8px;">
           <label style="min-width:80px;font-size:13px;">RF:</label>
-          <input type="number" name="mp_ft_rf_qty" value="<?php echo intval($d->mp_ft_rf_qty ?? 0); ?>" min="0" style="width:70px;padding:4px;" <?php echo $ro; ?>>
+          <input type="number" name="mp_ft_rf_qty" value="<?php echo isset($d->mp_ft_rf_qty) ? intval($d->mp_ft_rf_qty) : ''; ?>" min="0" style="width:70px;border:1px solid #ccc;padding:5px;background:#fff;<?php echo $ro_bg; ?>" <?php echo $ro; ?>>
         </div>
         <div style="display:flex;gap:15px;align-items:center;margin-bottom:8px;">
           <label style="min-width:80px;font-size:13px;">Electrical:</label>
-          <input type="number" name="mp_ft_elec_qty" value="<?php echo intval($d->mp_ft_elec_qty ?? 0); ?>" min="0" style="width:70px;padding:4px;" <?php echo $ro; ?>>
+          <input type="number" name="mp_ft_elec_qty" value="<?php echo isset($d->mp_ft_elec_qty) ? intval($d->mp_ft_elec_qty) : ''; ?>" min="0" style="width:70px;border:1px solid #ccc;padding:5px;background:#fff;<?php echo $ro_bg; ?>" <?php echo $ro; ?>>
         </div>
         <div style="display:flex;gap:15px;align-items:center;">
           <label style="min-width:80px;font-size:13px;">Others:</label>
-          <input type="text" name="mp_ft_others_spec" value="<?php echo esc_attr($d->mp_ft_others_spec ?? ''); ?>" placeholder="Specify..." style="flex:1;padding:4px;" <?php echo $ro; ?>>
-          <input type="number" name="mp_ft_others_qty" value="<?php echo intval($d->mp_ft_others_qty ?? 0); ?>" min="0" style="width:70px;padding:4px;" <?php echo $ro; ?>>
+          <input type="text" name="mp_ft_others_spec" value="<?php echo esc_attr($d->mp_ft_others_spec ?? ''); ?>" placeholder="Specify..." style="flex:1;border:1px solid #ccc;padding:5px;background:#fff;<?php echo $ro_bg; ?>" <?php echo $ro; ?>>
+          <input type="number" name="mp_ft_others_qty" value="<?php echo isset($d->mp_ft_others_qty) ? intval($d->mp_ft_others_qty) : ''; ?>" min="0" style="width:70px;border:1px solid #ccc;padding:5px;background:#fff;<?php echo $ro_bg; ?>" <?php echo $ro; ?>>
         </div>
       </td>
     </tr>
     <tr>
       <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;vertical-align:top;">Special Instructions (if any)</td>
-      <td style="border:1px solid #000;padding:8px 12px;"><textarea name="mp_special_instructions" rows="3" style="width:100%;border:1px solid #ccc;padding:6px;font-size:13px;" <?php echo $ro; ?>><?php echo esc_textarea($d->mp_special_instructions ?? ''); ?></textarea></td>
+      <td style="border:1px solid #000;padding:8px 12px;">
+        <textarea name="mp_special_instructions" id="mp_special_instructions" rows="3" maxlength="1000" style="width:100%;border:1px solid #ccc;padding:6px;font-size:13px;" <?php echo $ro; ?> onkeyup="uhvCountChars(this)"><?php echo esc_textarea($d->mp_special_instructions ?? ''); ?></textarea>
+        <div style="font-size:12px; color:#666; margin-top:4px;">Characters: <span id="mp_char_count">0</span> / 1000</div>
+      </td>
     </tr>
   </table>
   </div>
@@ -2088,49 +2619,64 @@ $bombing_checked = in_array('Bombing & Fine Leak Detection of Electronic Compone
   </div>
   <div style="padding:16px;">
   <table style="width:100%;border-collapse:collapse;">
-    <tr>
-      <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;width:40%;">Name of the specimen</td>
-      <td style="border:1px solid #000;padding:8px 12px;"><input class="block" name="tvc_specimen_name" value="<?php echo esc_attr($d->tvc_specimen_name ?? ''); ?>" <?php echo $ro; ?> style="<?php echo $ro_bg; ?>"></td>
-    </tr>
+<?php
+  $tvc_size = json_decode($d->tvc_package_size ?? '{}', true) ?: ['l'=>'','b'=>'','h'=>''];
+  $tvc_vac  = json_decode($d->tvc_vacuum_range ?? '{}', true) ?: ['mantissa'=>'','exponent'=>''];
+?>
     <tr>
       <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;">Size of package (L x B x H) in mm</td>
-      <td style="border:1px solid #000;padding:8px 12px;"><input class="block" name="tvc_package_size" value="<?php echo esc_attr($d->tvc_package_size ?? ''); ?>" <?php echo $ro; ?> style="<?php echo $ro_bg; ?>"></td>
-    </tr>
-    <tr>
-      <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;">Vacuum Range needed</td>
-      <td style="border:1px solid #000;padding:8px 12px;"><input class="block" name="tvc_vacuum_range" value="<?php echo esc_attr($d->tvc_vacuum_range ?? ''); ?>" <?php echo $ro; ?> style="<?php echo $ro_bg; ?>"></td>
-    </tr>
-    <tr>
-      <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;vertical-align:top;">Temperature needed</td>
       <td style="border:1px solid #000;padding:8px 12px;">
-        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
-          <label style="min-width:100px;">Hot Cycle:</label>
-          <input type="text" name="tvc_temp_hot" value="<?php echo esc_attr($d->tvc_temp_hot ?? ''); ?>" style="width:80px;" <?php echo $ro; ?>> °C ± 
-          <input type="text" name="tvc_temp_hot_tol" value="<?php echo esc_attr($d->tvc_temp_hot_tol ?? ''); ?>" style="width:60px;" <?php echo $ro; ?>>
-        </div>
-        <div style="display:flex;align-items:center;gap:10px;">
-          <label style="min-width:100px;">Cold Cycle:</label>
-          <input type="text" name="tvc_temp_cold" value="<?php echo esc_attr($d->tvc_temp_cold ?? ''); ?>" style="width:80px;" <?php echo $ro; ?>> °C ± 
-          <input type="text" name="tvc_temp_cold_tol" value="<?php echo esc_attr($d->tvc_temp_cold_tol ?? ''); ?>" style="width:60px;" <?php echo $ro; ?>>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <input type="number" step="any" min="0" placeholder="L" name="tvc_package_l" value="<?php echo esc_attr($tvc_size['l']); ?>" <?php echo $ro; ?> style="width:70px;padding:4px;<?php echo $ro_bg; ?>"> mm &times;
+          <input type="number" step="any" min="0" placeholder="B" name="tvc_package_b" value="<?php echo esc_attr($tvc_size['b']); ?>" <?php echo $ro; ?> style="width:70px;padding:4px;<?php echo $ro_bg; ?>"> mm &times;
+          <input type="number" step="any" min="0" placeholder="H" name="tvc_package_h" value="<?php echo esc_attr($tvc_size['h']); ?>" <?php echo $ro; ?> style="width:70px;padding:4px;<?php echo $ro_bg; ?>"> mm
         </div>
       </td>
     </tr>
     <tr>
-      <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;vertical-align:top;">Duration</td>
+      <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;">Vacuum Range needed</td>
       <td style="border:1px solid #000;padding:8px 12px;">
-        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
-          <label style="min-width:100px;">Hot Cycle:</label>
-          <input type="text" name="tvc_duration_hot" value="<?php echo esc_attr($d->tvc_duration_hot ?? ''); ?>" style="width:150px;" <?php echo $ro; ?>>
-        </div>
         <div style="display:flex;align-items:center;gap:10px;">
+          <input type="number" step="any" name="tvc_vacuum_mantissa" placeholder="e.g. 1" value="<?php echo esc_attr($tvc_vac['mantissa']); ?>" style="width:80px;padding:4px;<?php echo $ro_bg; ?>" <?php echo $ro; ?>>
+          <strong>&times; 10</strong>
+          <input type="number" step="1" name="tvc_vacuum_exponent" placeholder="-5" value="<?php echo esc_attr($tvc_vac['exponent']); ?>" style="width:60px;padding:4px;<?php echo $ro_bg; ?>" <?php echo $ro; ?>>
+          <span>mBar</span>
+        </div>
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;vertical-align:top;">Temperature needed</td>
+      <td style="border:1px solid #000;padding:8px 12px;">
+        <div style="display:flex;align-items:center;gap:15px;margin-bottom:8px;">
+          <label style="min-width:100px;">Hot Cycle:</label>
+          <input type="number" step="any" name="tvc_temp_hot" placeholder="Temp" value="<?php echo esc_attr($d->tvc_temp_hot ?? ''); ?>" style="width:80px;padding:4px;<?php echo $ro_bg; ?>" <?php echo $ro; ?>>
+          &plusmn; 
+          <input type="number" step="any" name="tvc_temp_hot_tol" placeholder="Tol" value="<?php echo esc_attr($d->tvc_temp_hot_tol ?? ''); ?>" style="width:60px;padding:4px;<?php echo $ro_bg; ?>" <?php echo $ro; ?>> °C
+        </div>
+        <div style="display:flex;align-items:center;gap:15px;">
           <label style="min-width:100px;">Cold Cycle:</label>
-          <input type="text" name="tvc_duration_cold" value="<?php echo esc_attr($d->tvc_duration_cold ?? ''); ?>" style="width:150px;" <?php echo $ro; ?>>
+          <input type="number" step="any" name="tvc_temp_cold" placeholder="Temp" value="<?php echo esc_attr($d->tvc_temp_cold ?? ''); ?>" style="width:80px;padding:4px;<?php echo $ro_bg; ?>" <?php echo $ro; ?>>
+          &plusmn; 
+          <input type="number" step="any" name="tvc_temp_cold_tol" placeholder="Tol" value="<?php echo esc_attr($d->tvc_temp_cold_tol ?? ''); ?>" style="width:60px;padding:4px;<?php echo $ro_bg; ?>" <?php echo $ro; ?>> °C
+        </div>
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;vertical-align:top;">Duration (hours)</td>
+      <td style="border:1px solid #000;padding:8px 12px;">
+        <div style="display:flex;align-items:center;gap:15px;margin-bottom:8px;">
+          <label style="min-width:100px;">Hot Cycle:</label>
+          <input type="number" step="any" min="0" name="tvc_duration_hot" value="<?php echo esc_attr($d->tvc_duration_hot ?? ''); ?>" style="width:100px;padding:4px;<?php echo $ro_bg; ?>" <?php echo $ro; ?>>
+        </div>
+        <div style="display:flex;align-items:center;gap:15px;">
+          <label style="min-width:100px;">Cold Cycle:</label>
+          <input type="number" step="any" min="0" name="tvc_duration_cold" value="<?php echo esc_attr($d->tvc_duration_cold ?? ''); ?>" style="width:100px;padding:4px;<?php echo $ro_bg; ?>" <?php echo $ro; ?>>
         </div>
       </td>
     </tr>
     <tr>
       <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;">No. of cycles required</td>
-      <td style="border:1px solid #000;padding:8px 12px;"><input class="block" name="tvc_cycles_required" value="<?php echo esc_attr($d->tvc_cycles_required ?? ''); ?>" <?php echo $ro; ?> style="<?php echo $ro_bg; ?>"></td>
+      <td style="border:1px solid #000;padding:8px 12px;"><input type="number" min="0" class="block" name="tvc_cycles_required" value="<?php echo esc_attr($d->tvc_cycles_required ?? ''); ?>" <?php echo $ro; ?> style="border:1px solid #ccc;padding:5px;background:#fff;<?php echo $ro_bg; ?>"></td>
     </tr>
     <tr>
       <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;">Cycling to be started with</td>
@@ -2142,11 +2688,21 @@ $bombing_checked = in_array('Bombing & Fine Leak Detection of Electronic Compone
     </tr>
     <tr>
       <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;">No. of "T" type Thermocouples mounted</td>
-      <td style="border:1px solid #000;padding:8px 12px;"><input class="block" name="tvc_thermocouples" value="<?php echo esc_attr($d->tvc_thermocouples ?? ''); ?>" <?php echo $ro; ?> style="<?php echo $ro_bg; ?>"></td>
+      <td style="border:1px solid #000;padding:8px 12px;"><input type="number" min="0" class="block" name="tvc_thermocouples" value="<?php echo esc_attr($d->tvc_thermocouples ?? ''); ?>" <?php echo $ro; ?> style="border:1px solid #ccc;padding:5px;background:#fff;<?php echo $ro_bg; ?>"></td>
     </tr>
     <tr>
-      <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;vertical-align:top;">Instructions (if any) / Other Tests</td>
-      <td style="border:1px solid #000;padding:8px 12px;"><textarea name="tvc_instructions" rows="3" placeholder="Other Tests: (Attach details)" style="width:100%;border:1px solid #ccc;padding:6px;font-size:13px;" <?php echo $ro; ?>><?php echo esc_textarea($d->tvc_instructions ?? ''); ?></textarea></td>
+      <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;vertical-align:top;">Instructions (if any)</td>
+      <td style="border:1px solid #000;padding:8px 12px;">
+        <textarea name="tvc_instructions" id="tvc_instructions" rows="3" maxlength="1000" style="width:100%;border:1px solid #ccc;padding:6px;font-size:13px;" <?php echo $ro; ?> onkeyup="uhvCountChars(this)"><?php echo esc_textarea($d->tvc_instructions ?? ''); ?></textarea>
+        <div style="font-size:12px; color:#666; margin-top:4px;">Characters: <span id="tvc_instruction_count">0</span> / 1000</div>
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;vertical-align:top;">Other Tests</td>
+      <td style="border:1px solid #000;padding:8px 12px;">
+        <textarea name="tvc_other_tests" id="tvc_other_tests" rows="3" maxlength="1000" placeholder="Other Tests: (Attach details)" style="width:100%;border:1px solid #ccc;padding:6px;font-size:13px;" <?php echo $ro; ?> onkeyup="uhvCountChars(this)"><?php echo esc_textarea($d->tvc_other_tests ?? ''); ?></textarea>
+        <div style="font-size:12px; color:#666; margin-top:4px;">Characters: <span id="tvc_other_count">0</span> / 1000</div>
+      </td>
     </tr>
   </table>
   </div>
@@ -2180,31 +2736,55 @@ $bombing_checked = in_array('Bombing & Fine Leak Detection of Electronic Compone
         <td style="border:1px solid #000;padding:5px;text-align:center;"><?php echo $i; ?>.</td>
         <td style="border:1px solid #000;padding:2px;"><input type="text" name="vcm_desc[]" value="<?php echo esc_attr($s['desc']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
         <td style="border:1px solid #000;padding:2px;"><input type="text" name="vcm_sample[]" value="<?php echo esc_attr($s['sample']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
-        <td style="border:1px solid #000;padding:2px;"><input type="text" name="vcm_qty[]" value="<?php echo esc_attr($s['qty']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
+        <td style="border:1px solid #000;padding:2px;"><input type="number" step="any" name="vcm_qty[]" value="<?php echo esc_attr($s['qty']??''); ?>" style="width:100%;border:1px solid #ccc;padding:5px;background:#fff;<?php echo $ro_bg; ?>" <?php echo $ro; ?>></td>
         <td style="border:1px solid #000;padding:2px;"><input type="text" name="vcm_others[]" value="<?php echo esc_attr($s['others']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
       </tr>
       <?php endfor; ?>
     </tbody>
   </table>
 
+  <?php 
+    $vcm_vac = json_decode($d->vcm_vacuum_req ?? '{}', true);
+  ?>
   <table style="width:100%;border-collapse:collapse;background:#fff;">
     <tr>
       <td style="border:1px solid #000;padding:10px;background:#f9f9f9;font-weight:600;width:25%;">Vacuum Requirement:</td>
-      <td style="border:1px solid #000;padding:10px;"><input class="block" name="vcm_vacuum_req" value="<?php echo esc_attr($d->vcm_vacuum_req ?? ''); ?>" <?php echo $ro; ?>></td>
+      <td style="border:1px solid #000;padding:10px;">
+        <div style="display:flex;align-items:center;gap:5px;">
+          <input type="number" step="any" name="vcm_vacuum_mantissa" value="<?php echo esc_attr($vcm_vac['mantissa'] ?? ''); ?>" placeholder="e.g. 1" style="width:60px;padding:4px;" <?php echo $ro; ?>>
+          <span style="font-weight:700;">X 10</span>
+          <input type="number" step="1" name="vcm_vacuum_exponent" value="<?php echo esc_attr($vcm_vac['exponent'] ?? ''); ?>" placeholder="-5" style="width:40px;padding:4px;" <?php echo $ro; ?>>
+          <span>mBar</span>
+        </div>
+      </td>
       <td style="border:1px solid #000;padding:10px;background:#f9f9f9;font-weight:600;width:25%;">Temperature Requirement:</td>
       <td style="border:1px solid #000;padding:10px;"></td>
     </tr>
     <tr>
-      <td style="border:1px solid #000;padding:10px;background:#f9f9f9;font-weight:600;">Duration:</td>
-      <td style="border:1px solid #000;padding:10px;"><input class="block" name="vcm_duration" value="<?php echo esc_attr($d->vcm_duration ?? ''); ?>" <?php echo $ro; ?>></td>
+      <td style="border:1px solid #000;padding:10px;background:#f9f9f9;font-weight:600;">Duration (hours):</td>
+      <td style="border:1px solid #000;padding:10px;"><input type="number" step="any" class="block" name="vcm_duration" value="<?php echo esc_attr($d->vcm_duration ?? ''); ?>" <?php echo $ro; ?>></td>
       <td style="border:1px solid #000;padding:10px;background:#f9f9f9;font-weight:600;">a. Hot Sample bar:</td>
-      <td style="border:1px solid #000;padding:10px;"><input class="block" name="vcm_temp_hot_bar" value="<?php echo esc_attr($d->vcm_temp_hot_bar ?? ''); ?>" <?php echo $ro; ?>></td>
+      <td style="border:1px solid #000;padding:10px;">
+        <div style="display:flex;align-items:center;gap:5px;">
+          <input type="number" step="any" inputmode="decimal" name="vcm_temp_hot_bar" value="<?php echo esc_attr($d->vcm_temp_hot_bar ?? ''); ?>" placeholder="Temp" style="width:60%;padding:4px;" <?php echo $ro; ?>>
+          <span>&plusmn;</span>
+          <input type="number" step="any" inputmode="decimal" name="vcm_temp_hot_bar_tol" value="<?php echo esc_attr($d->vcm_temp_hot_bar_tol ?? ''); ?>" placeholder="Tol" style="width:30%;padding:4px;" <?php echo $ro; ?>>
+          <span>&deg;C</span>
+        </div>
+      </td>
     </tr>
     <tr>
       <td style="border:1px solid #000;padding:10px;background:#f9f9f9;font-weight:600;">No. of samples loaded:</td>
-      <td style="border:1px solid #000;padding:10px;"><input class="block" name="vcm_samples_loaded" value="<?php echo esc_attr($d->vcm_samples_loaded ?? ''); ?>" <?php echo $ro; ?>></td>
+      <td style="border:1px solid #000;padding:10px;"><input type="number" class="block" name="vcm_samples_loaded" value="<?php echo esc_attr($d->vcm_samples_loaded ?? ''); ?>" <?php echo $ro; ?> style="border:1px solid #ccc;padding:5px;background:#fff;<?php echo $ro_bg; ?>"></td>
       <td style="border:1px solid #000;padding:10px;background:#f9f9f9;font-weight:600;">b. Cold Collector plate bar:</td>
-      <td style="border:1px solid #000;padding:10px;"><input class="block" name="vcm_temp_cold_bar" value="<?php echo esc_attr($d->vcm_temp_cold_bar ?? ''); ?>" <?php echo $ro; ?>></td>
+      <td style="border:1px solid #000;padding:10px;">
+        <div style="display:flex;align-items:center;gap:5px;">
+          <input type="number" step="any" inputmode="decimal" name="vcm_temp_cold_bar" value="<?php echo esc_attr($d->vcm_temp_cold_bar ?? ''); ?>" placeholder="Temp" style="width:60%;padding:4px;" <?php echo $ro; ?>>
+          <span>&plusmn;</span>
+          <input type="number" step="any" inputmode="decimal" name="vcm_temp_cold_bar_tol" value="<?php echo esc_attr($d->vcm_temp_cold_bar_tol ?? ''); ?>" placeholder="Tol" style="width:30%;padding:4px;" <?php echo $ro; ?>>
+          <span>&deg;C</span>
+        </div>
+      </td>
     </tr>
   </table>
   </div>
@@ -2235,17 +2815,22 @@ $bombing_checked = in_array('Bombing & Fine Leak Detection of Electronic Compone
           "Shrouds / Bellows",
           "Vacuum lines & fittings",
           "Wave guides / Valves / Gauges",
-          "Others (Specify)"
+          "Others"
       ];
       $msld_samples = json_decode($d->msld_samples_json ?? '[]', true);
       foreach($msld_rows as $idx => $desc): 
-        $s = $msld_samples[$idx] ?? ['qty'=>'','remarks'=>''];
+        $s = $msld_samples[$idx] ?? ['qty'=>'','remarks'=>'','others_spec'=>''];
       ?>
       <tr>
         <td style="border:1px solid #000;padding:5px;text-align:center;"><?php echo $idx+1; ?>.</td>
-        <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;"><?php echo $desc; ?></td>
-        <td style="border:1px solid #000;padding:2px;"><input type="text" name="msld_qty[]" value="<?php echo esc_attr($s['qty']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
-        <td style="border:1px solid #000;padding:2px;"><input type="text" name="msld_remarks[]" value="<?php echo esc_attr($s['remarks']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
+        <td style="border:1px solid #000;padding:8px 12px;background:#f5f5f5;font-weight:600;">
+          <?php echo $desc; ?>
+          <?php if($desc === "Others"): ?>
+            <br><input type="text" name="msld_others_spec" value="<?php echo esc_attr($s['others_spec']??''); ?>" placeholder="Specify..." style="width:100%; border: 1px solid #ccc; padding: 5px; background: #fff; margin-top: 5px; font-weight: normal; box-sizing: border-box;" <?php echo $ro; ?>>
+          <?php endif; ?>
+        </td>
+        <td style="border:1px solid #000;padding:2px;"><input type="number" step="any" name="msld_qty[]" value="<?php echo esc_attr($s['qty']??''); ?>" style="width:100%;border:1px solid #ccc;padding:5px;background:#fff;<?php echo $ro_bg; ?>" <?php echo $ro; ?>></td>
+        <td style="border:1px solid #000;padding:2px;"><input type="text" name="msld_remarks[]" value="<?php echo esc_attr($s['remarks']??''); ?>" style="width:100%;border:1px solid #ccc;padding:5px;background:#fff;<?php echo $ro_bg; ?>" <?php echo $ro; ?>></td>
       </tr>
       <?php endforeach; ?>
     </tbody>
@@ -2354,7 +2939,7 @@ $bombing_checked = in_array('Bombing & Fine Leak Detection of Electronic Compone
         <tr>
           <td style="border:1px solid #000;padding:5px;text-align:center;"><?php echo $i; ?>.</td>
           <td style="border:1px solid #000;padding:2px;"><input type="text" name="corona_desc[]" value="<?php echo esc_attr($s['desc']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
-          <td style="border:1px solid #000;padding:2px;"><input type="text" name="corona_qty[]" value="<?php echo esc_attr($s['qty']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
+          <td style="border:1px solid #000;padding:2px;"><input type="number" step="any" name="corona_qty[]" value="<?php echo esc_attr($s['qty']??''); ?>" style="width:100%;border:1px solid #ccc;padding:5px;background:#fff;<?php echo $ro_bg; ?>" <?php echo $ro; ?>></td>
           <td style="border:1px solid #000;padding:2px;"><input type="text" name="corona_vacuum[]" value="<?php echo esc_attr($s['vacuum']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
           <td style="border:1px solid #000;padding:2px;"><input type="text" name="corona_duration[]" value="<?php echo esc_attr($s['duration']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
           <td style="border:1px solid #000;padding:2px;"><input type="text" name="corona_remarks[]" value="<?php echo esc_attr($s['remarks']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
@@ -2401,7 +2986,7 @@ $bombing_checked = in_array('Bombing & Fine Leak Detection of Electronic Compone
         <tr>
           <td style="border:1px solid #000;padding:5px;text-align:center;"><?php echo $i; ?>.</td>
           <td style="border:1px solid #000;padding:2px;"><input type="text" name="bombing_name[]" value="<?php echo esc_attr($s['name']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
-          <td style="border:1px solid #000;padding:2px;"><input type="text" name="bombing_qty[]" value="<?php echo esc_attr($s['qty']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
+          <td style="border:1px solid #000;padding:2px;"><input type="number" step="any" name="bombing_qty[]" value="<?php echo esc_attr($s['qty']??''); ?>" style="width:100%;border:1px solid #ccc;padding:5px;background:#fff;<?php echo $ro_bg; ?>" <?php echo $ro; ?>></td>
           <td style="border:1px solid #000;padding:2px;"><input type="text" name="bombing_pressure[]" value="<?php echo esc_attr($s['pressure']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
           <td style="border:1px solid #000;padding:2px;"><input type="text" name="bombing_dwell[]" value="<?php echo esc_attr($s['dwell']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
           <td style="border:1px solid #000;padding:2px;"><input type="text" name="bombing_rate[]" value="<?php echo esc_attr($s['rate']??''); ?>" style="width:100%;border:none;padding:5px;" <?php echo $ro; ?>></td>
@@ -2469,6 +3054,12 @@ function uhvToggleTestForm() {
     if (gauge_checked) types.push('Calibration of Vacuum Gauges');
     if (bombing_checked) types.push('Bombing & Fine Leak Detection of Electronic Components');
     
+    // Add corona and other if they exist (for future-proofing)
+    var corona = document.getElementById('tt_corona');
+    var other = document.getElementById('tt_other');
+    if (corona && corona.checked) types.push('Corona / High Altitude Test');
+    if (other && other.checked)   types.push('Other Special Test');
+    
     if (hidden) hidden.value = types.join(', ');
 
     // Show hint if nothing selected
@@ -2478,7 +3069,29 @@ function uhvToggleTestForm() {
 document.addEventListener('DOMContentLoaded', function() { 
     uhvToggleTestForm(); 
     if (typeof toggleQA === 'function') toggleQA(); 
+    if (document.getElementById('mp_special_instructions')) uhvCountChars(document.getElementById('mp_special_instructions'));
+    if (document.getElementById('tvc_instructions')) uhvCountChars(document.getElementById('tvc_instructions'));
+    if (document.getElementById('tvc_other_tests')) uhvCountChars(document.getElementById('tvc_other_tests'));
 });
+function uhvCountChars(el) {
+    var id = el.id;
+    var counterId = '';
+    if (id === 'mp_special_instructions') counterId = 'mp_char_count';
+    else if (id === 'tvc_instructions') counterId = 'tvc_instruction_count';
+    else if (id === 'tvc_other_tests') counterId = 'tvc_other_count';
+    
+    if (counterId) {
+        var counter = document.getElementById(counterId);
+        if (counter) counter.innerText = el.value.length;
+    }
+}
+function uhvToggleMPProfileUpload() {
+    var sel = document.querySelector('select[name="mp_test_profile_attach"]');
+    var div = document.getElementById('mp_profile_upload_div');
+    if (sel && div) {
+        div.style.display = (sel.value === 'Yes') ? 'block' : 'none';
+    }
+}
 <?php if (!$resubmit): // available for new, draft, and qa_rejected_edit ?>
 function toggleQA() {
     const qaFields = document.querySelectorAll('.qa_field');
@@ -2516,6 +3129,30 @@ function fetchQAData() {
     })
     .catch(function(){ alert('Error fetching employee data. Please try again.'); });
 }
+
+// Staff Execution Duration Calculator
+jQuery(document).ready(function($) {
+    function calculateDuration() {
+        var startVal = $('input[name="test_started_datetime"]').val();
+        var endVal = $('input[name="test_completed_datetime"]').val();
+        if (startVal && endVal) {
+            var start = new Date(startVal);
+            var end = new Date(endVal);
+            var diff = end - start;
+            if (diff >= 0) {
+                var totalSeconds = Math.floor(diff / 1000);
+                var hours = Math.floor(totalSeconds / 3600);
+                var minutes = Math.floor((totalSeconds % 3600) / 60);
+                var seconds = totalSeconds % 60;
+                var display = [hours, minutes, seconds].map(v => v < 10 ? "0" + v : v).join(":");
+                $('input[name="test_duration"]').val(display);
+            } else {
+                $('input[name="test_duration"]').val("Invalid Range");
+            }
+        }
+    }
+    $('input[name="test_started_datetime"], input[name="test_completed_datetime"]').on('change input', calculateDuration);
+});
 
 // MSLD Submission Confirmation Logic
 var msldConfirmed = false;
@@ -2633,34 +3270,33 @@ function mgr_tabs($active, $cnt_pending, $cnt_my_qa_pending=0) {
         if ($t['key']===$active && !empty($t['qa'])) $style = ' style="background:#4a148c;color:#fff;font-weight:700;"';
         echo "<a href='".esc_url($t['href'])."' class='$cls'$style>".esc_html($t['label'])."</a>";
     }
-    echo "<a href='".esc_url(add_query_arg('mgr_action','create_new'))."' class='mgr-tab mgr-tab-new'>+ NEW REQUEST</a>";
+    $new_req_url = remove_query_arg(['resume_draft', 'view_id', 'prog_id', 'uhv_msg'], add_query_arg('mgr_action', 'create_new', get_permalink()));
+    echo "<a href='".esc_url($new_req_url)."' class='mgr-tab mgr-tab-new'>+ NEW REQUEST</a>";
     echo '</div>';
 }
 
 // =====================================================================
 //  SHARED: STAT CARDS
 // =====================================================================
-function mgr_stat_cards($cnt_pending, $cnt_approved, $cnt_rejected, $cnt_completed, $cnt_my_qa_pending=0) {
+function mgr_stat_cards($cnt_pending, $cnt_qa_review, $cnt_testing, $cnt_rejected, $cnt_completed) {
     $base = get_permalink(); ?>
-<div class="stat-grid">
-  <a href="<?php echo esc_url(add_query_arg('mgr_action','pending',$base)); ?>" class="stat-card sc-pending" style="text-decoration:none;cursor:pointer;">
-    <div class="stat-num"><?php echo $cnt_pending; ?></div><div class="stat-lbl">Pending Approval</div>
-  </a>
-  <?php if ($cnt_my_qa_pending > 0): ?>
-  <a href="<?php echo esc_url(add_query_arg('mgr_action','qa_review',$base)); ?>" class="stat-card" style="border-color:#6f42c1;background:#f3eeff;color:#4a148c;text-decoration:none;cursor:pointer;">
-    <div class="stat-num"><?php echo $cnt_my_qa_pending; ?></div><div class="stat-lbl">My QA Reviews Pending</div>
-  </a>
-  <?php endif; ?>
-  <a href="<?php echo esc_url(add_query_arg('mgr_action','in_testing',$base)); ?>" class="stat-card sc-approved" style="text-decoration:none;cursor:pointer;">
-    <div class="stat-num"><?php echo $cnt_approved; ?></div><div class="stat-lbl">In Testing</div>
-  </a>
-  <a href="<?php echo esc_url(add_query_arg('mgr_action','rejected_list',$base)); ?>" class="stat-card" style="border-color:#dc3545;background:#fff5f5;color:#721c24;text-decoration:none;cursor:pointer;">
-    <div class="stat-num"><?php echo $cnt_rejected; ?></div><div class="stat-lbl">Rejected</div>
-  </a>
-  <a href="<?php echo esc_url(add_query_arg('mgr_action','completed_list',$base)); ?>" class="stat-card" style="border-color:#000;background:#f8f8f8;color:#000;text-decoration:none;cursor:pointer;">
-    <div class="stat-num"><?php echo $cnt_completed; ?></div><div class="stat-lbl">Completed</div>
-  </a>
-</div>
+  <div class="stat-grid" style="margin-bottom:30px;">
+    <a href="<?php echo esc_url(add_query_arg('mgr_action','pending',$base)); ?>" class="stat-card sc-pending" style="text-decoration:none;cursor:pointer;">
+      <div class="stat-num"><?php echo $cnt_pending; ?></div><div class="stat-lbl">Awaiting My Decision</div>
+    </a>
+    <a href="<?php echo esc_url(add_query_arg('mgr_action','qa_review',$base)); ?>" class="stat-card" style="border-color:#6f42c1;background:#f3eeff;color:#4a148c;text-decoration:none;cursor:pointer;">
+      <div class="stat-num"><?php echo $cnt_qa_review; ?></div><div class="stat-lbl">In QA Review</div>
+    </a>
+    <a href="<?php echo esc_url(add_query_arg('mgr_action','in_testing',$base)); ?>" class="stat-card sc-approved" style="text-decoration:none;cursor:pointer;">
+      <div class="stat-num"><?php echo $cnt_testing; ?></div><div class="stat-lbl">In Testing</div>
+    </a>
+    <a href="<?php echo esc_url(add_query_arg('mgr_action','rejected_list',$base)); ?>" class="stat-card" style="border-color:#dc3545;background:#fff5f5;color:#721c24;text-decoration:none;cursor:pointer;">
+      <div class="stat-num"><?php echo $cnt_rejected; ?></div><div class="stat-lbl">Rejected / Returned</div>
+    </a>
+    <a href="<?php echo esc_url(add_query_arg('mgr_action','completed_list',$base)); ?>" class="stat-card" style="border-color:#000;background:#f8f8f8;color:#000;text-decoration:none;cursor:pointer;">
+      <div class="stat-num"><?php echo $cnt_completed; ?></div><div class="stat-lbl">Completed</div>
+    </a>
+  </div>
 <?php }
 
 // =====================================================================
@@ -2690,6 +3326,16 @@ function uhv_get_extended_pipeline_steps($req) {
             'rejected' => $qa_rejected
         ];
     }
+
+    // New Step: Staff Review (Phase 1)
+    $staff_rechecked = ($req->status === 'recheck_indenter');
+    $steps[] = [
+        'label'    => $staff_rechecked ? 'Staff Recheck' : 'Staff Review',
+        'done'     => !in_array($req->status, ['pending_staff', 'recheck_staff', 'pending_qa', 'qa_rejected', 'draft_indenter']),
+        'date'     => $req->staff_review_date ?? null,
+        'stage'    => 'staff_review',
+        'rejected' => $staff_rechecked
+    ];
 
     $mgr_rejected = ($req->status === 'rejected');
     $mgr_returned = ($req->status === 'manager_returned');
@@ -2746,7 +3392,7 @@ function uhv_get_extended_pipeline_steps($req) {
 //  HELPER: Display test-type specific sub-form data (read-only)
 // =====================================================================
 function uhv_render_test_subforms_readonly($req) {
-    $types = array_filter(explode(',', $req->test_types ?? ''));
+    $types = array_filter(array_map('trim', explode(',', $req->test_types ?? '')));
     // Fallback: if test_types empty but test_type exists, treat as TVP/TBT
     if (empty($types) && !empty($req->test_type)) $types = ['Multipaction Test'];
     if (empty($types)) return;
@@ -2763,10 +3409,25 @@ function uhv_render_test_subforms_readonly($req) {
         echo $box_open;
         echo '<div style="'.$hdr_style.'">&#9654; Multipaction Test — Test Requirement Details</div>';
         echo '<div style="padding:12px;"><table style="width:100%;border-collapse:collapse;font-size:17px;">';
+        
+        $mp_size_disp = '—';
+        if (!empty($req->mp_package_size)) {
+            $sz = json_decode($req->mp_package_size, true);
+            if (is_array($sz)) {
+                $mp_size_disp = esc_html($sz['l']??'').' mm &times; '.esc_html($sz['b']??'').' mm &times; '.esc_html($sz['h']??'').' mm';
+            } else {
+                $mp_size_disp = esc_html($req->mp_package_size);
+            }
+        }
+
+        $profile_link = esc_html($req->mp_test_profile_attach ?? '');
+        if (!empty($req->mp_test_profile_file)) {
+            $profile_link .= ' (<a href="'.esc_url($req->mp_test_profile_file).'" target="_blank">View PDF</a>)';
+        }
+
         $mp_fields = [
-            'Package Name'              => esc_html($req->mp_package_name ?? ''),
-            'Package Size (mm)'         => esc_html($req->mp_package_size ?? ''),
-            'Test Profile Attached'     => esc_html($req->mp_test_profile_attach ?? ''),
+            'Package Size (L x B x H)'  => $mp_size_disp,
+            'Test Profile Attached'     => $profile_link,
             'No. of Thermocouples'      => esc_html($req->mp_thermocouples ?? ''),
             'Feedthrough RF Qty'        => intval($req->mp_ft_rf_qty ?? 0),
             'Feedthrough Elec. Qty'     => intval($req->mp_ft_elec_qty ?? 0),
@@ -2786,18 +3447,38 @@ function uhv_render_test_subforms_readonly($req) {
         echo $box_open;
         echo '<div style="'.$hdr_style.'">&#9654; Thermal Vacuum Cycling Test — Test Requirement Details</div>';
         echo '<div style="padding:12px;"><table style="width:100%;border-collapse:collapse;font-size:17px;">';
+        $tvc_size_disp = '—';
+        if (!empty($req->tvc_package_size)) {
+            $sz = json_decode($req->tvc_package_size, true);
+            if (is_array($sz)) {
+                $tvc_size_disp = esc_html($sz['l']??'').' mm &times; '.esc_html($sz['b']??'').' mm &times; '.esc_html($sz['h']??'').' mm';
+            } else {
+                $tvc_size_disp = esc_html($req->tvc_package_size);
+            }
+        }
+
+        $tvc_vac_disp = '—';
+        if (!empty($req->tvc_vacuum_range)) {
+            $vac = json_decode($req->tvc_vacuum_range, true);
+            if (is_array($vac)) {
+                $tvc_vac_disp = esc_html($vac['mantissa']??'').' &times; 10<sup>'.esc_html($vac['exponent']??'').'</sup> mBar';
+            } else {
+                $tvc_vac_disp = esc_html($req->tvc_vacuum_range);
+            }
+        }
+
         $tvc_fields = [
-            'Name of Specimen'          => esc_html($req->tvc_specimen_name ?? ''),
-            'Package Size (mm)'         => esc_html($req->tvc_package_size ?? ''),
-            'Vacuum Range (mbar)'       => esc_html($req->tvc_vacuum_range ?? ''),
+            'Package Size (L x B x H)'  => $tvc_size_disp,
+            'Vacuum Range'              => $tvc_vac_disp,
             'Temperature (Hot)'         => esc_html($req->tvc_temp_hot ?? '').' &deg;C (&plusmn;'.esc_html($req->tvc_temp_hot_tol ?? '').')',
             'Temperature (Cold)'        => esc_html($req->tvc_temp_cold ?? '').' &deg;C (&plusmn;'.esc_html($req->tvc_temp_cold_tol ?? '').')',
-            'Duration (Hot)'            => esc_html($req->tvc_duration_hot ?? ''),
-            'Duration (Cold)'           => esc_html($req->tvc_duration_cold ?? ''),
+            'Duration (Hot) (hours)'    => esc_html($req->tvc_duration_hot ?? ''),
+            'Duration (Cold) (hours)'   => esc_html($req->tvc_duration_cold ?? ''),
             'No. of Cycles Required'    => esc_html($req->tvc_cycles_required ?? ''),
             'Start of Cycle (Hot/Cold)' => esc_html($req->tvc_start_cycle ?? ''),
             'No. of Thermocouples'      => esc_html($req->tvc_thermocouples ?? ''),
-            'Special Instructions'      => nl2br(esc_html($req->tvc_instructions ?? '')),
+            'Instructions (if any)'     => nl2br(esc_html($req->tvc_instructions ?? '')),
+            'Other Tests'               => nl2br(esc_html($req->tvc_other_tests ?? '')),
         ];
         foreach ($tvc_fields as $label => $val) {
             echo '<tr><th style="'.$th_style.'">'.esc_html($label).'</th>';
@@ -2827,14 +3508,24 @@ function uhv_render_test_subforms_readonly($req) {
             echo '</tr>';
         }
         echo '</tbody></table>';
+        echo '<table style="width:100%; border-collapse:collapse; font-size:16px;">';
 
-        echo '<table style="width:100%;border-collapse:collapse;font-size:17px;">';
+        $vcm_vac_disp = '—';
+        if (!empty($req->vcm_vacuum_req)) {
+            $vac = json_decode($req->vcm_vacuum_req, true);
+            if (is_array($vac)) {
+                $vcm_vac_disp = esc_html($vac['mantissa']??'').' &times; 10<sup>'.esc_html($vac['exponent']??'').'</sup> mBar';
+            } else {
+                $vcm_vac_disp = esc_html($req->vcm_vacuum_req);
+            }
+        }
+
         $vcm_fields = [
-            'Vacuum Requirement (mbar)' => esc_html($req->vcm_vacuum_req ?? ''),
-            'Duration (H)'             => esc_html($req->vcm_duration ?? ''),
+            'Vacuum Requirement (mbar)' => $vcm_vac_disp,
+            'Duration (H)'             => esc_html($req->vcm_duration ?? '').' H',
             'No. of Samples Loaded'    => esc_html($req->vcm_samples_loaded ?? ''),
-            'Hot Bar Temperature (&deg;C)' => esc_html($req->vcm_temp_hot_bar ?? ''),
-            'Cold Bar Temperature (&deg;C)' => esc_html($req->vcm_temp_cold_bar ?? ''),
+            'Hot Bar Temperature (&deg;C)' => esc_html($req->vcm_temp_hot_bar ?? '').' &deg;C (&plusmn;'.esc_html($req->vcm_temp_hot_bar_tol ?? '').')',
+            'Cold Bar Temperature (&deg;C)' => esc_html($req->vcm_temp_cold_bar ?? '').' &deg;C (&plusmn;'.esc_html($req->vcm_temp_cold_bar_tol ?? '').')',
         ];
         foreach ($vcm_fields as $label => $val) {
             echo '<tr><th style="'.$th_style.'">'.esc_html($label).'</th>';
@@ -2857,14 +3548,19 @@ function uhv_render_test_subforms_readonly($req) {
             "Shrouds / Bellows",
             "Vacuum lines & fittings",
             "Wave guides / Valves / Gauges",
-            "Others (Specify)"
+            "Others"
         ];
         $msld_data = json_decode($req->msld_samples_json ?? '[]', true);
         foreach($msld_rows as $idx => $desc) {
-            $row = $msld_data[$idx] ?? ['qty'=>'','remarks'=>''];
+            $row = $msld_data[$idx] ?? ['qty'=>'','remarks'=>'','others_spec'=>''];
             echo '<tr>';
             echo '<td style="'.$td_style.';text-align:center;">'.($idx+1).'</td>';
-            echo '<td style="'.$td_style.'">'.esc_html($desc).'</td>';
+            echo '<td style="'.$td_style.'">';
+            echo esc_html($desc);
+            if ($desc === "Others" && !empty($row['others_spec'])) {
+                echo ' ('.esc_html($row['others_spec']).')';
+            }
+            echo '</td>';
             echo '<td style="'.$td_style.'">'.esc_html($row['qty'] ?? '').'</td>';
             echo '<td style="'.$td_style.'">'.esc_html($row['remarks'] ?? '').'</td>';
             echo '</tr>';
@@ -3021,12 +3717,12 @@ function uhv_pipeline($steps) {
             $label_col = '#b8860b';
             $sub = 'In Progress';
             $sub_col = '#b8860b';
-            $sub_bg = 'rgba(255,193,7,0.1)';
+            $sub_bg = 'rgba(255,193,7,0.15)';
         } else {
-            $bg = '#eee';
-            $co = '#999';
-            $border = '#ddd';
-            $glow = '';
+            $bg = '#fff';
+            $co = '#888';
+            $border = '#adb5bd';
+            $glow = 'box-shadow: 0 0 0 4px #fff;';
             $icon = ($i + 1);
             $label_col = '#888';
             $sub = 'Waiting';
@@ -3093,12 +3789,14 @@ function uhv_qa_history_detail($req, $back_url, $role_label, $show_wrapper = tru
     <?php endif; ?>
   </table>
   <?php uhv_render_test_subforms_readonly($req); ?>
+  <?php uhv_render_per_test_risk_readonly($req, 'Staff Risk Assessment (Per Test)'); ?>
+  <?php uhv_render_execution_details_readonly($req); ?>
   <div style="margin-top:25px;padding:22px;border:2px solid #6f42c1;background:#faf7ff;border-radius:6px;">
     <h4 style="margin:0 0 14px;font-size:18px;font-weight:700;color:#6f42c1;text-transform:uppercase;letter-spacing:.5px;">&#9876; QA / T&amp;E Review (Read-Only)</h4>
     <table style="width:100%;border-collapse:collapse;font-size:17px;">
       <tr><td style="border:1px solid #ddd;padding:12px;background:#f5f5f5;font-weight:700;width:30%;">Reviewed By</td><td style="border:1px solid #ddd;padding:12px;"><?php echo esc_html($req->qa_reviewer_name?:'—'); ?></td></tr>
       <tr><td style="border:1px solid #ddd;padding:12px;background:#f5f5f5;font-weight:700;">Review Date</td><td style="border:1px solid #ddd;padding:12px;"><?php echo !empty($req->qa_review_date)?date('d M Y, h:i A',strtotime($req->qa_review_date)):'—'; ?></td></tr>
-      <tr><td style="border:1px solid #ddd;padding:12px;background:#f5f5f5;font-weight:700;">Decision</td><td style="border:1px solid #ddd;padding:12px;"><?php echo $req->qa_decision==='accept'?'<span style="color:#28a745;font-weight:700;">&#10003; Accepted &amp; Forwarded to Manager</span>':'<span style="color:#fd7e14;font-weight:700;">&#10007; Rejected &amp; Returned to Indenter</span>'; ?></td></tr>
+      <tr><td style="border:1px solid #ddd;padding:12px;background:#f5f5f5;font-weight:700;">Decision</td><td style="border:1px solid #ddd;padding:12px;"><?php echo $req->qa_decision==='accept'?'<span style="color:#28a745;font-weight:700;">&#10003; Accepted &amp; Forwarded to Manager</span>':'<span style="color:#fd7e14;font-weight:700;">&#10007; Rejected &amp; Returned to User</span>'; ?></td></tr>
       <?php if (!empty($req->qa_remarks)): ?>
       <tr><td style="border:1px solid #ddd;padding:12px;background:#f5f5f5;font-weight:700;vertical-align:top;">Remarks</td><td style="border:1px solid #ddd;padding:12px;"><?php echo nl2br(esc_html($req->qa_remarks)); ?></td></tr>
       <?php endif; ?>
@@ -3111,9 +3809,11 @@ function uhv_qa_history_detail($req, $back_url, $role_label, $show_wrapper = tru
 }
 
 // =====================================================================
-//  INDENTER VIEW
+//  USER VIEW (subsystem engineers + any other employee submitting a TR)
+//  UHV staff may enter here only for QA dashboard when nominated (same routes as other users).
 // =====================================================================
-if ($user_role === 'indenter') {
+$uhv_in_user_qa_flow = ($user_role === 'UHV' && ($_GET['action'] ?? '') === 'qa_dashboard');
+if (in_array($user_role, ['indenter', 'tr_submitter'], true) || $uhv_in_user_qa_flow) {
     $action  = $_GET['action'] ?? 'dashboard';
     $view_id = intval($_GET['view_id'] ?? 0);
 
@@ -3126,7 +3826,7 @@ if ($user_role === 'indenter') {
         if ($complete_id) {
             // ── Individual staff form ──
             $fd = $wpdb->get_row($wpdb->prepare(
-                "SELECT * FROM {$table} WHERE id=%d AND status IN ('approved','completed')", $complete_id
+                "SELECT * FROM {$table} WHERE id=%d AND status IN ('pending_staff','recheck_staff','approved','completed')", $complete_id
             ));
             if ($fd): ?>
 <div class="form-container">
@@ -3139,15 +3839,24 @@ if ($user_role === 'indenter') {
 <div class="draft-notice"><strong>&#128203; Draft Saved:</strong> Last saved by <strong><?php echo esc_html($fd->draft_saved_by ?? 'Unknown'); ?></strong> on <strong><?php echo date('d M Y, h:i A', strtotime($fd->draft_saved_at)); ?></strong></div>
 <?php endif; ?>
 <?php
+$uhv_msg = sanitize_text_field($_GET['uhv_msg'] ?? '');
 $_vs_errs = get_transient('uhv_errors_'.$user->ID);
-if (!empty($_vs_errs)) {
-    delete_transient('uhv_errors_'.$user->ID);
-    echo "<div style='background:#f8d7da;color:#721c24;border:2px solid #dc3545;padding:16px 20px;margin-bottom:20px;border-radius:4px;'>";
-    echo "<strong>&#9888; Please fix:</strong><ul style='margin:10px 0 0 20px;'>";
-    foreach ($_vs_errs as $e) echo '<li>'.esc_html($e).'</li>';
-    echo "</ul></div>";
-}
+if ($uhv_msg === 'validation_error' || !empty($_vs_errs)): 
+    if (!empty($_vs_errs)) delete_transient('uhv_errors_'.$user->ID);
 ?>
+<div style="background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;padding:14px 20px;margin-bottom:25px;border-radius:4px;">
+    <strong>&#9888; Please fix the following errors:</strong>
+    <ul style="margin:10px 0 0 20px; padding:0;">
+        <?php 
+        if (!empty($_vs_errs)) {
+            foreach ($_vs_errs as $err) echo '<li>'.esc_html($err).'</li>';
+        } else {
+            echo '<li>All fields in the Staff Review section are mandatory before forwarding to the manager.</li>';
+        }
+        ?>
+    </ul>
+</div>
+<?php endif; ?>
 <h1>UHV Staff Form &mdash; <?php echo esc_html($fd->test_requisition_no); ?></h1>
 <?php
 // Pipeline for this form
@@ -3169,7 +3878,7 @@ $_ref = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $fd-
 if ($_ref):
 ?>
 <div style="margin-bottom:22px;padding:18px;background:#e3f2fd;border-left:4px solid #2196F3;border-radius:4px;">
-  <h3 style="margin-top:0;color:#1565c0;">&#128203; Indenter Request Details (Reference)</h3>
+  <h3 style="margin-top:0;color:#1565c0;">&#128203; User Request Details (Reference)</h3>
   <table style="width:100%;border-collapse:collapse;font-size:13px;">
     <tr><th style="border:1px solid #ccc;padding:9px;background:#f5f5f5;width:30%;">Test Object</th><td style="border:1px solid #ccc;padding:9px;"><?php echo esc_html($_ref->satellite_name); ?></td></tr>
     <tr><th style="border:1px solid #ccc;padding:9px;background:#f5f5f5;">Test Type</th><td style="border:1px solid #ccc;padding:9px;"><?php echo esc_html(!empty($_ref->test_types) ? $_ref->test_types : $_ref->test_type); ?></td></tr>
@@ -3206,10 +3915,94 @@ if ($_ref):
     <tr><th style="border:1px solid #ccc;padding:6px;background:#f5f5f5;">Test Reviewed?</th><td style="border:1px solid #ccc;padding:6px;"><?php echo esc_html($_ref->test_received_reviewed ?: '—'); ?></td><th style="border:1px solid #ccc;padding:6px;background:#f5f5f5;">Object Accepted?</th><td style="border:1px solid #ccc;padding:6px;"><?php echo esc_html($_ref->test_object_accepted ?: '—'); ?></td></tr>
     <tr><th style="border:1px solid #ccc;padding:6px;background:#f5f5f5;">Accepted By</th><td style="border:1px solid #ccc;padding:6px;" colspan="3"><?php echo esc_html($_ref->test_accepted_by ?: '—'); ?></td></tr>
   </table>
+  <?php uhv_render_execution_details_readonly($_ref); ?>
 </div>
 <?php endif; ?>
 <?php endif; // $_ref ?>
 
+<?php if (in_array($fd->status, ['pending_staff', 'recheck_staff'])): ?>
+<!-- ══ PHASE 1: STAFF REVIEW (Sync with UHV Block & Image 1) ══ -->
+<div style="margin:25px 0; padding:30px; border:2px solid #0d6efd; background:#fff; border-radius:10px; box-shadow: 0 4px 15px rgba(13, 110, 253, 0.08);">
+  <h2 style="text-align:center; font-size:22px; font-weight:700; margin:0 0 10px 0; text-transform:uppercase;">(TO BE FILLED BY UHV STAFF)</h2>
+  <p style="text-align:center; color:#666; font-size:14px; margin-bottom:25px;">Assess each test requisitioned per QMS guidelines.</p>
+  
+  <form method="post" enctype="multipart/form-data">
+    <?php wp_nonce_field('uhv_action','uhv_nonce'); ?>
+    <input type="hidden" name="form_id" value="<?php echo intval($fd->id); ?>">
+    <input type="hidden" name="uhv_staff_form_marker" value="1">
+    
+    <?php 
+    $risk_map = uhv_get_per_test_risk($fd);
+    $labels_ordered = uhv_get_selected_test_labels($fd);
+    foreach ($labels_ordered as $i => $test_label):
+        $risk = $risk_map[$test_label] ?? ['test_object_accepted'=>'','risk_assessed_uhv'=>'','rpn_uhv'=>'','risk_record_uhv'=>'','risk_table_url'=>''];
+    ?>
+    <div style="margin-bottom:35px; border-bottom:2px solid #eee; padding-bottom:25px;">
+      <h3 style="margin:0 0 15px; font-size:18px; color:#0d6efd; font-weight:700;">Test: <?php echo esc_html($test_label); ?></h3>
+      <table style="width:100%; border-collapse:collapse; background:#fff; font-size:16px; border:1px solid #000;">
+        <tr>
+          <td style="border:1px solid #000; padding:15px; width:65%; font-weight:500;">1. Test request received, reviewed and accepted for testing</td>
+              <td style="border:1px solid #000; padding:15px; width:35%; text-align:center;">
+                <div style="display:flex; justify-content:center; gap:15px;">
+                  <label><input type="radio" name="risk_test_object_accepted[<?php echo $i; ?>]" value="yes" <?php checked(strtolower($risk['test_object_accepted'] ?? ''),'yes'); ?>> Yes</label>
+                  <label><input type="radio" name="risk_test_object_accepted[<?php echo $i; ?>]" value="no" <?php checked(strtolower($risk['test_object_accepted'] ?? ''),'no'); ?>> No</label>
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <td style="border:1px solid #000; padding:15px; vertical-align:middle;">
+                <div style="margin-bottom:8px; font-weight:500;">2. Risk Assessed as per Online QMS UHV Lab Risk Table</div>
+                <div style="display:flex; gap:15px;">
+                  <label><input type="radio" name="risk_assessed_uhv[<?php echo $i; ?>]" value="yes" <?php checked(strtolower($risk['risk_assessed_uhv'] ?? ''),'yes'); ?>> Yes</label>
+                  <label><input type="radio" name="risk_assessed_uhv[<?php echo $i; ?>]" value="no" <?php checked(strtolower($risk['risk_assessed_uhv'] ?? ''),'no'); ?>> No</label>
+                </div>
+              </td>
+              <td style="border:1px solid #000; padding:15px; vertical-align:middle;">
+                <div style="margin-bottom:10px; font-weight:500;">3. Risk Priority No.(RPN):</div>
+                <div style="display:flex; gap:15px; align-items:center;">
+                  <label>&le; 4 <input type="radio" name="rpn_uhv[<?php echo $i; ?>]" value="lt4" <?php checked($risk['rpn_uhv'] ?? '','lt4'); ?> onclick="uhvIndRpnUpload(<?php echo (int) $i; ?>,'lt4')"></label>
+                  <label>&ge; 5 <input type="radio" name="rpn_uhv[<?php echo $i; ?>]" value="gte5" <?php checked($risk['rpn_uhv'] ?? '','gte5'); ?> onclick="uhvIndRpnUpload(<?php echo (int) $i; ?>,'gte5')"></label>
+                </div>
+              </td>
+              <td style="border:1px solid #000; padding:15px; text-align:center; vertical-align:middle;">
+                 <div style="margin-bottom:8px; font-weight:500;">4. Risk Record:</div>
+                 <div style="display:flex; justify-content:center; gap:8px;">
+                   <label><input type="radio" name="risk_record_uhv[<?php echo $i; ?>]" value="yes" <?php checked(strtolower($risk['risk_record_uhv'] ?? ''),'yes'); ?>> Yes</label>
+                   <label><input type="radio" name="risk_record_uhv[<?php echo $i; ?>]" value="no" <?php checked(strtolower($risk['risk_record_uhv'] ?? ''),'no'); ?>> No</label>
+                   <label><input type="radio" name="risk_record_uhv[<?php echo $i; ?>]" value="na" <?php checked(strtolower($risk['risk_record_uhv'] ?? ''),'na'); ?>> NA</label>
+                 </div>
+              </td>
+        </tr>
+      </table>
+      <div id="risk_upload_ind_<?php echo (int) $i; ?>" style="display:<?php echo (($risk['rpn_uhv'] ?? '') === 'gte5') ? 'block' : 'none'; ?>; margin-top:12px; border:1px dashed #0d6efd; padding:10px; border-radius:4px; background:#f0f7ff;">
+        <label style="display:block; font-size:13px; font-weight:600; margin-bottom:6px; color:#0d6efd;">Upload Risk Table (PDF/Image) <span style="color:#dc3545;">*</span> <small style="font-weight:400;">(required if RPN &ge; 5)</small></label>
+        <input type="file" name="risk_table_file_<?php echo (int) $i; ?>" accept=".pdf,image/*" style="font-size:13px; width:100%; max-width:420px;">
+        <?php if (!empty($risk['risk_table_url'])): ?>
+          <div style="margin-top:6px;"><small>Existing: <a href="<?php echo esc_url($risk['risk_table_url']); ?>" target="_blank" rel="noopener">View file</a></small></div>
+          <input type="hidden" name="existing_risk_table_url[<?php echo (int) $i; ?>]" value="<?php echo esc_attr($risk['risk_table_url']); ?>">
+        <?php endif; ?>
+      </div>
+    </div>
+    <?php endforeach; ?>
+
+    <div style="background:#f8f9fa; padding:15px; border:1px solid #ddd; border-radius:8px; margin-bottom:20px;">
+      <label style="display:block; margin-bottom:8px; font-weight:700; color:#333;">Review Remarks / Recheck Instructions:</label>
+      <textarea name="staff_review_comment" placeholder="Enter comments for the manager or instructions for user recheck..." style="width:100%; min-height:80px; border:1px solid #ccc; border-radius:4px; padding:10px; font-family:inherit; font-size:14px;"></textarea>
+    </div>
+
+    <div style="margin-top:40px; border-top:2px solid #eee; padding-top:25px; display:flex; gap:15px; justify-content:flex-end; align-items:center;">
+      <button type="submit" name="staff_review_action" value="recheck_indenter" class="btn btn-reject" style="background:#fd7e14; border:none; padding:12px 25px; font-weight:600; color:#fff;" onclick="return confirm('Send back for clarification?');">↩ Send to User for Recheck</button>
+      <button type="submit" name="staff_review_action" value="forward_manager" class="btn btn-approve" style="background:#28a745; border:none; padding:12px 35px; font-weight:700; color:#fff; font-size:16px;">Forward to Manager &rarr;</button>
+    </div>
+  </form>
+  <script>
+  function uhvIndRpnUpload(idx, val) {
+    var d = document.getElementById('risk_upload_ind_' + idx);
+    if (d) { d.style.display = (val === 'gte5') ? 'block' : 'none'; }
+  }
+  </script>
+</div>
+<?php else: ?>
 <!-- UHV Fill Form -->
 <form method="post" data-form-status="<?php echo esc_attr($fd->status ?? ''); ?>" data-logged-in-name="<?php echo esc_attr($emp->name ?? ''); ?>">
 <?php wp_nonce_field('uhv_action','uhv_nonce'); ?>
@@ -3221,40 +4014,68 @@ if ($_ref):
 <tr><th colspan="2">Subsystem Engineer</th><td colspan="2" class="view-only"><?php echo esc_html($fd->sub_name.' ('.$fd->sub_stno.')'); ?></td></tr>
 </table>
 <?php uhv_render_test_subforms_readonly($fd); ?>
-<div style="border:2px solid #000;padding:25px;margin:25px 0;background:#fff;border-radius:4px;">
-<h3 style="margin-top:0;">(To Be Filled by UHV Staff)</h3>
+<!-- ══ PHASE 2: STAFF EXECUTION (Sync with UHV Block & Image 2) ══ -->
+<div style="border:1px solid #000; padding:25px; margin:25px 0; background:#fff; border-radius:4px;">
+  <h3 style="margin:0 0 20px; text-decoration:underline;">(To Be Filled by UHV Staff)</h3>
 
-<!-- Section A: read-only, filled by Manager during approval -->
-<h4 style="font-size:14px;font-weight:700;margin:0 0 10px 0;padding-bottom:6px;border-bottom:2px solid #000;text-transform:uppercase;letter-spacing:.5px;color:#343a40;">
-  Section A &mdash; Pre-Test Assessment <span style="font-weight:400;font-size:12px;color:#6c757d;">(Filled by Manager &mdash; Read Only)</span>
-</h4>
-<table style="width:100%;border-collapse:collapse;margin-bottom:22px;">
-  <tr style="background:#f5f5f5;"><td style="border:1px solid #000;padding:12px;font-weight:600;width:50%;">Requisition Received on</td><td style="border:1px solid #000;padding:12px;"><?php echo !empty($fd->requisition_received_date) ? date('d M Y', strtotime($fd->requisition_received_date)) : '<em style="color:#aaa;">—</em>'; ?></td></tr>
-  <tr><td style="border:1px solid #000;padding:12px;">Risk assessed? (Yes/No)</td><td style="border:1px solid #000;padding:12px;"><?php echo esc_html($fd->risk_assessed_uhv ?: '—'); ?></td></tr>
-  <tr style="background:#f5f5f5;"><td style="border:1px solid #000;padding:12px;font-weight:600;">Risk Priority Number (RPN)</td><td style="border:1px solid #000;padding:12px;"><?php $rpn_v=$fd->rpn_uhv??''; echo $rpn_v==='lt4' ? '&lt; 4 (Low Risk)' : ($rpn_v==='gte5' ? '&ge; 5 (High Risk)' : (esc_html($rpn_v)?:'&mdash;')); if($rpn_v==='gte5'&&!empty($fd->risk_form_file)): ?> &nbsp;<a href="<?php echo esc_url($fd->risk_form_file); ?>" target="_blank" style="font-size:12px;color:#28a745;">&#128206; View File</a><?php endif; ?></td></tr>
-  <tr><td style="border:1px solid #000;padding:12px;">Risk Assessment Form filled? (Yes/No)</td><td style="border:1px solid #000;padding:12px;"><?php echo esc_html($fd->risk_form_filled ?: '—'); ?></td></tr>
-  <tr><td style="border:1px solid #000;padding:12px;">Any special Processes? (Yes/No)</td><td style="border:1px solid #000;padding:12px;"><?php echo esc_html($fd->special_processes ?: '—'); ?></td></tr>
-  <tr><td style="border:1px solid #000;padding:12px;">Test Received &amp; Reviewed? (Yes/No)</td><td style="border:1px solid #000;padding:12px;"><?php echo esc_html($fd->test_received_reviewed ?: '—'); ?></td></tr>
-  <tr style="background:#f5f5f5;"><td style="border:1px solid #000;padding:12px;font-weight:600;">Test object accepted? (Yes/No)</td><td style="border:1px solid #000;padding:12px;"><?php echo esc_html($fd->test_object_accepted ?: '—'); ?></td></tr>
-  <tr><td style="border:1px solid #000;padding:12px;">Test Request Accepted by (Dy.Manager, UHV or Competent Authority)</td><td style="border:1px solid #000;padding:12px;"><?php echo esc_html($fd->test_accepted_by ?: '—'); ?></td></tr>
-</table>
-<h3 style="margin-top:28px;">Test Details</h3>
-<table style="width:100%;border-collapse:collapse;">
-  <tr><td style="border:1px solid #000;padding:12px;font-weight:600;">Test Started on</td><td style="border:1px solid #000;padding:12px;"><input type="datetime-local" class="block" name="test_started_datetime" value="<?php echo esc_attr(str_replace(' ','T',$fd->test_started_datetime??'')); ?>" required></td></tr>
-  <tr style="background:#f5f5f5;"><td style="border:1px solid #000;padding:12px;font-weight:600;">Test Completed On</td><td style="border:1px solid #000;padding:12px;"><input type="datetime-local" class="block" name="test_completed_datetime" value="<?php echo esc_attr(str_replace(' ','T',$fd->test_completed_datetime??'')); ?>" required></td></tr>
-  <tr><td style="border:1px solid #000;padding:12px;font-weight:600;">Test Duration</td><td style="border:1px solid #000;padding:12px;"><input type="text" class="block" name="test_duration" placeholder="HH:MM:SS (auto-calculated)" value="<?php echo esc_attr($fd->test_duration??''); ?>" readonly style="background:#f5f5f5;cursor:not-allowed;"></td></tr>
-  <tr style="background:#f5f5f5;"><td style="border:1px solid #000;padding:12px;">Is Test Completed on-time?</td><td style="border:1px solid #000;padding:12px;">
-    <input type="hidden" name="test_on_time" id="testontime2_val" value="<?php echo esc_attr(ucfirst(strtolower($fd->test_on_time??''))); ?>">
-    <label class="uniform-check-label"><input type="checkbox" class="uniform-check-input" id="testontime2_yes" <?php echo (strtolower($fd->test_on_time??'')==='yes')?'checked':''; ?> onchange="uhvToggleCb(this,'testontime2_no','testontime2_val','Yes')"> Yes</label>
-    <label class="uniform-check-label"><input type="checkbox" class="uniform-check-input" id="testontime2_no" <?php echo (strtolower($fd->test_on_time??'')==='no')?'checked':''; ?> onchange="uhvToggleCb(this,'testontime2_yes','testontime2_val','No')"> No</label>
-  </td></tr>
-  <tr><td colspan="2" style="border:1px solid #000;padding:12px;font-weight:600;">Test specimen collected by</td></tr>
-  <tr><td style="border:1px solid #000;padding:12px;">Name:</td><td style="border:1px solid #000;padding:12px;"><input type="text" class="block" name="specimen_collected_by_name" value="<?php echo esc_attr($fd->specimen_collected_by_name??''); ?>" data-auto-fill="logged-in-name" required></td></tr>
-  <tr style="background:#f5f5f5;"><td style="border:1px solid #000;padding:12px;">Signature:</td><td style="border:1px solid #000;padding:12px;"><input type="text" class="block" name="specimen_collected_by_sig" placeholder="Signature / Initials / Timestamp" value="<?php echo esc_attr($fd->specimen_collected_by_sig??''); ?>" data-auto-fill="signature" required></td></tr>
-  <tr><td colspan="2" style="border:1px solid #000;padding:12px;font-weight:600;">Verification and requisition closed by (Dy.Manager, UHV or competent authority)</td></tr>
-  <tr><td style="border:1px solid #000;padding:12px;">Name:</td><td style="border:1px solid #000;padding:12px;"><input type="text" class="block" name="verification_closed_by_name" value="<?php echo esc_attr($fd->verification_closed_by_name??''); ?>" data-auto-fill="logged-in-name" required></td></tr>
-  <tr style="background:#f5f5f5;"><td style="border:1px solid #000;padding:12px;">Signature:</td><td style="border:1px solid #000;padding:12px;"><input type="text" class="block" name="verification_closed_by_sig" placeholder="Signature / Initials / Timestamp" value="<?php echo esc_attr($fd->verification_closed_by_sig??''); ?>" data-auto-fill="signature" required></td></tr>
-</table>
+  <!-- Read-only risk assessed pre-filled by staff previously -->
+  <?php uhv_render_per_test_risk_readonly($fd, 'Section A — Pre-Test Assessment (Filled by Staff)'); ?>
+
+  <div style="margin-top:25px; border:1px solid #000;">
+    <h3 style="margin:0; padding:12px; background:#f8f9fa; border-bottom:1px solid #000; font-size:17px; font-weight:700; text-transform:uppercase;">SECTION B — TEST EXECUTION DETAILS</h3>
+    <table style="width:100%; border-collapse:collapse; font-size:16px;">
+      <tr>
+        <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff; width:45%;">Test Started on <span style="color:#dc3545;">*</span></th>
+        <td style="border:1px solid #000; padding:10px;"><input type="datetime-local" class="block" name="test_started_datetime" value="<?php echo esc_attr(str_replace(' ','T',$fd->test_started_datetime ?? '')); ?>" style="border:1px solid #ccc; padding:8px;"></td>
+      </tr>
+      <tr>
+        <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Test Completed on <span style="color:#dc3545;">*</span></th>
+        <td style="border:1px solid #000; padding:10px;"><input type="datetime-local" class="block" name="test_completed_datetime" value="<?php echo esc_attr(str_replace(' ','T',$fd->test_completed_datetime ?? '')); ?>" style="border:1px solid #ccc; padding:8px;"></td>
+      </tr>
+      <tr>
+        <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Test Duration <small style="font-weight:400; color:#666;">(auto-calculated)</small></th>
+        <td style="border:1px solid #000; padding:10px;"><input type="text" class="block" name="test_duration" value="<?php echo esc_attr($fd->test_duration ?? ''); ?>" placeholder="HH:MM:SS" readonly style="background:#f8f9fa; cursor:not-allowed; border:1px solid #ccc; padding:8px;"></td>
+      </tr>
+      <tr>
+        <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Test Completed On-Time?</th>
+        <td style="border:1px solid #000; padding:10px;">
+          <input type="hidden" name="test_on_time" id="testontime2_val" value="<?php echo esc_attr(ucfirst(strtolower($fd->test_on_time ?? ''))); ?>">
+          <div style="display:flex; gap:20px; align-items:center;">
+            <label style="cursor:pointer; display:flex; align-items:center; gap:8px;"><input type="checkbox" id="testontime2_yes" <?php echo (strtolower($fd->test_on_time??'')=='yes')?'checked':''; ?> onchange="uhvToggleCb(this,'testontime2_no','testontime2_val','Yes')"> Yes</label>
+            <label style="cursor:pointer; display:flex; align-items:center; gap:8px;"><input type="checkbox" id="testontime2_no" <?php echo (strtolower($fd->test_on_time??'')=='no')?'checked':''; ?> onchange="uhvToggleCb(this,'testontime2_yes','testontime2_val','No')"> No</label>
+          </div>
+        </td>
+      </tr>
+      <tr>
+        <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Test Code</th>
+        <td style="border:1px solid #000; padding:10px;"><input type="text" class="block" name="test_code" value="<?php echo esc_attr($fd->test_code ?? ''); ?>" placeholder="e.g. URSC-TC-001" style="border:1px solid #ccc; padding:8px;"></td>
+      </tr>
+    </table>
+  </div>
+
+  <div style="margin-top:25px; border:1px solid #000;">
+    <h3 style="margin:0; padding:12px; background:#f8f9fa; border-bottom:1px solid #000; font-size:17px; font-weight:700; text-transform:uppercase;">SECTION C — SPECIMEN COLLECTION &amp; CLOSURE</h3>
+    <table style="width:100%; border-collapse:collapse; font-size:16px;">
+      <tr style="background:#000; color:#fff;"><th colspan="2" style="padding:10px; text-align:left; font-weight:600;">Test Specimen Collected By</th></tr>
+      <tr>
+        <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff; width:45%;">Name <span style="color:#dc3545;">*</span></th>
+        <td style="border:1px solid #000; padding:10px;"><input type="text" class="block" name="specimen_collected_by_name" value="<?php echo esc_attr($fd->specimen_collected_by_name ?? ''); ?>" placeholder="Auto-filled with your name" data-auto-fill="logged-in-name" style="border:1px solid #ccc; padding:8px;"></td>
+      </tr>
+      <tr>
+        <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Signature / Initials <span style="color:#dc3545;">*</span></th>
+        <td style="border:1px solid #000; padding:10px;"><input type="text" class="block" name="specimen_collected_by_sig" value="<?php echo esc_attr($fd->specimen_collected_by_sig ?? ''); ?>" placeholder="Auto-filled with name &amp; timestamp" data-auto-fill="signature" style="border:1px solid #ccc; padding:8px;"></td>
+      </tr>
+      <tr style="background:#000; color:#fff;"><th colspan="2" style="padding:10px; text-align:left; font-weight:600;">Verification &amp; Requisition Closed By <small style="font-weight:400;">(Dy. Manager UHV or Competent Authority)</small></th></tr>
+      <tr>
+        <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff; width:45%;">Name <span style="color:#dc3545;">*</span></th>
+        <td style="border:1px solid #000; padding:10px;"><input type="text" class="block" name="verification_closed_by_name" value="<?php echo esc_attr($fd->verification_closed_by_name ?? ''); ?>" placeholder="Auto-filled with your name" data-auto-fill="logged-in-name" style="border:1px solid #ccc; padding:8px;"></td>
+      </tr>
+      <tr>
+        <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Signature / Initials <span style="color:#dc3545;">*</span></th>
+        <td style="border:1px solid #000; padding:10px;"><input type="text" class="block" name="verification_closed_by_sig" value="<?php echo esc_attr($fd->verification_closed_by_sig ?? ''); ?>" placeholder="Auto-filled with name &amp; timestamp" data-auto-fill="signature" style="border:1px solid #ccc; padding:8px;"></td>
+      </tr>
+    </table>
+  </div>
 </div>
 <div style="text-align:right;margin-top:30px;display:flex;justify-content:flex-end;gap:15px;flex-wrap:wrap;">
   <button type="submit" name="save_draft" class="btn btn-draft">&#128190; SAVE DRAFT</button>
@@ -3262,6 +4083,7 @@ if ($_ref):
 </div>
 </form>
 </div>
+<?php endif; ?>
 <script>
 document.addEventListener('DOMContentLoaded', function() {
     var fs = document.querySelector('[data-form-status]') ? document.querySelector('[data-form-status]').getAttribute('data-form-status') : '';
@@ -3308,7 +4130,7 @@ document.addEventListener('DOMContentLoaded', function() {
         } else {
             // ── Staff Form LIST: all approved + completed records ──────────────
             $all_staff_forms = $wpdb->get_results(
-                "SELECT * FROM {$table} WHERE status IN ('approved','completed') ORDER BY approval_date DESC"
+                "SELECT * FROM {$table} WHERE status IN ('pending_staff','recheck_staff','approved','completed') ORDER BY approval_date DESC"
             );
 ?>
 <div class="container">
@@ -3407,7 +4229,7 @@ document.addEventListener('DOMContentLoaded', function() {
 <div class="role-indicator">QA REVIEW | <?php echo esc_html($emp->name.' ('.$emp->stno.')'); ?></div>
 <div style="margin-bottom:20px;display:flex;gap:10px;flex-wrap:wrap;">
   <a href="<?php echo esc_url(add_query_arg('action','qa_dashboard', remove_query_arg(['qa_view','uhv_msg'], get_permalink()))); ?>" class="btn btn-primary">&larr; QA Dashboard</a>
-  <a href="<?php echo get_permalink(); ?>" class="btn btn-primary" style="background:#555;">&larr; My Dashboard</a>
+  <a href="<?php echo esc_url(get_permalink()); ?>" class="btn btn-primary" style="background:#555;">&larr; <?php echo $GLOBALS['user_role'] === 'UHV' ? 'Staff Dashboard' : 'My Dashboard'; ?></a>
 </div>
 <div class="request-card">
   <div class="request-header">
@@ -3434,6 +4256,7 @@ document.addEventListener('DOMContentLoaded', function() {
     <?php if (!empty($req->special_requirements)): ?><tr><th>Special Requirements</th><td colspan="3" style="background:#fff3cd;"><?php echo nl2br(esc_html($req->special_requirements)); ?></td></tr><?php endif; ?>
   </table>
   <?php uhv_render_test_subforms_readonly($req); ?>
+  <?php uhv_render_per_test_risk_readonly($req, 'Staff Risk Assessment (Per Test)'); ?>
   <form method="post" style="margin-top:30px;">
     <?php wp_nonce_field('uhv_action','uhv_nonce'); ?>
     <input type="hidden" name="form_id" value="<?php echo intval($req->id); ?>">
@@ -3447,9 +4270,9 @@ document.addEventListener('DOMContentLoaded', function() {
       </table>
       <div style="display:flex;gap:16px;flex-wrap:wrap;">
         <button type="submit" name="qa_decision" value="accept" class="btn btn-approve" onclick="return confirm('Accept and forward to Manager?')">&#10003; ACCEPT &amp; FORWARD TO MANAGER</button>
-        <button type="submit" name="qa_decision" value="reject" class="btn btn-reject" onclick="return confirm('Reject and return to Indenter?')">&#10007; REJECT &amp; RETURN TO INDENTER</button>
+        <button type="submit" name="qa_decision" value="reject" class="btn btn-reject" onclick="return confirm('Reject and return to User?')">&#10007; REJECT &amp; RETURN TO USER</button>
       </div>
-      <p style="font-size:13px;color:#666;margin-top:14px;"><strong>Accept</strong> &rarr; forwarded to Manager &nbsp;|&nbsp; <strong>Reject</strong> &rarr; returned to Indenter with remarks</p>
+      <p style="font-size:13px;color:#666;margin-top:14px;"><strong>Accept</strong> &rarr; forwarded to Manager &nbsp;|&nbsp; <strong>Reject</strong> &rarr; returned to User with remarks</p>
     </div>
   </form>
 </div>
@@ -3467,9 +4290,9 @@ document.addEventListener('DOMContentLoaded', function() {
 <?php if ($uhv_msg_ind === 'qa_accepted'): ?>
 <div style="background:#d4edda;color:#155724;border:1px solid #c3e6cb;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#10003; <strong>Request accepted and forwarded to Manager.</strong></div>
 <?php elseif ($uhv_msg_ind === 'qa_rejected'): ?>
-<div style="background:#fff3cd;color:#856404;border:1px solid #ffc107;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#10003; <strong>Request rejected and returned to Indenter with your remarks.</strong></div>
+<div style="background:#fff3cd;color:#856404;border:1px solid #ffc107;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#10003; <strong>Request rejected and returned to User with your remarks.</strong></div>
 <?php endif; ?>
-<div style="margin-bottom:20px;"><a href="<?php echo get_permalink(); ?>" class="btn btn-primary">&larr; Back to My Dashboard</a></div>
+<div style="margin-bottom:20px;"><a href="<?php echo esc_url(get_permalink()); ?>" class="btn btn-primary">&larr; <?php echo $GLOBALS['user_role'] === 'UHV' ? 'Back to Staff Dashboard' : 'Back to My Dashboard'; ?></a></div>
 <h1>My QA Review Dashboard</h1>
 <div style="background:#faf7ff;border:2px solid #6f42c1;padding:14px 20px;margin-bottom:25px;border-radius:6px;font-size:14px;">
   &#128100; You are listed as the <strong>nominated QA/T&amp;E Engineer</strong> on the requests below. Review each one and accept or reject.
@@ -3509,7 +4332,7 @@ document.addEventListener('DOMContentLoaded', function() {
 <?php if (!empty($my_reviewed_qa)): ?>
 <h3>&#128203; My QA Review History</h3>
 <table class="list-table" id="table-qa-dashboard-history">
-  <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Decision</th><th>Review Date</th><th>Remarks</th><th>Action</th></tr></thead>
+  <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Submitted Date</th><th>Decision</th><th>Review Date</th><th>Remarks</th><th>Action</th></tr></thead>
   <tbody>
   <?php foreach ($my_reviewed_qa as $_qrh):
     $_dec = ($_qrh->qa_decision==='accept')
@@ -3523,6 +4346,7 @@ document.addEventListener('DOMContentLoaded', function() {
     <td><?php echo $_tr_disp; ?></td>
     <td><?php echo esc_html($_qrh->satellite_name); ?></td>
     <td><?php echo esc_html($_qrh->sub_name); ?></td>
+    <td><?php echo !empty($_qrh->submission_date) ? date('d M Y, h:i A', strtotime($_qrh->submission_date)) : '—'; ?></td>
     <td><?php echo $_dec; ?></td>
     <td><?php echo !empty($_qrh->qa_review_date)?date('d M Y, h:i A',strtotime($_qrh->qa_review_date)):'&mdash;'; ?></td>
     <td style="max-width:200px;font-size:13px;color:#555;"><?php echo esc_html($_qrh->qa_remarks?:'&mdash;'); ?></td>
@@ -3537,10 +4361,10 @@ document.addEventListener('DOMContentLoaded', function() {
         } // end qa_view_id else
 
     // ---------------------------------------------------------------
-    // DEFAULT: Indenter main dashboard (unchanged)
+    // DEFAULT: User main dashboard (unchanged)
     // ---------------------------------------------------------------
     } elseif ($action === 'create_new') {
-        indenter_create_new_label:
+        user_create_new_label:
         // Resume specific draft if requested, or latest draft
         $resume_id = intval($_GET['resume_draft'] ?? 0);
         if ($resume_id) {
@@ -3553,7 +4377,7 @@ document.addEventListener('DOMContentLoaded', function() {
             $existing_draft = null;
         } ?>
 <div class="form-container">
-<div class="role-indicator">INDENTER VIEW | <?php echo esc_html($emp->name.' ('.$emp->stno.')'); ?></div>
+<div class="role-indicator">USER VIEW | <?php echo esc_html($emp->name.' ('.$emp->stno.')'); ?></div>
 <div style="margin-bottom:25px;"><a href="<?php echo get_permalink(); ?>" class="btn btn-primary">&larr; Back to Dashboard</a></div>
 <h1>New Request Submission</h1>
 <?php
@@ -3586,9 +4410,10 @@ if (!empty($_uhv_errs)) {
             if($req->status==='recheck_indenter')  $bc='badge-qa-rejected'; // amber styling
 ?>
 <div class="container">
-<div class="role-indicator">INDENTER VIEW | <?php echo esc_html($emp->name.' ('.$emp->stno.')'); ?></div>
+<div class="role-indicator">USER VIEW | <?php echo esc_html($emp->name.' ('.$emp->stno.')'); ?></div>
 <div style="margin-bottom:25px;display:flex;gap:10px;align-items:center;">
   <a href="<?php echo get_permalink(); ?>" class="btn btn-primary">← Back to My Requests</a>
+  <?php uhv_print_button($req->id); ?>
   <?php uhv_history_button($req->id); ?>
 </div>
 <div class="request-card">
@@ -3625,6 +4450,7 @@ if (!empty($_uhv_errs)) {
     <?php endif;?>
   </table>
   <?php uhv_render_test_subforms_readonly($req); ?>
+  <?php uhv_render_per_test_risk_readonly($req, 'Staff Risk Assessment (Per Test)'); ?>
 
 
   <?php if (!empty($req->qa_reviewer_name)): ?>
@@ -3670,47 +4496,9 @@ if (!empty($_uhv_errs)) {
     </tr>
   </table>
 
-  <?php if (in_array($req->status, ['approved','completed'])): ?>
-  <h3 style="margin-top:18px;">Section A — Pre-Test Assessment <small style="font-weight:400;font-size:13px;color:#6c757d;">(Filled by Manager)</small></h3>
-  <table>
-    <tr>
-      <th style="width:40%">Requisition Received on</th>
-      <td><?php echo !empty($req->requisition_received_date) ? date('d M Y', strtotime($req->requisition_received_date)) : '—'; ?></td>
-    </tr>
-    <tr>
-      <th>Risk Assessed?</th>
-      <td><?php echo esc_html($req->risk_assessed_uhv ?: '—'); ?></td>
-    </tr>
-    <tr>
-      <th>Risk Priority Number (RPN)</th>
-      <td><?php $rpn_v=$req->rpn_uhv??''; echo $rpn_v==='lt4' ? '&lt; 4' : ($rpn_v==='gte5' ? '&ge; 5' : (esc_html($rpn_v)?:'&mdash;')); ?></td>
-    </tr>
-    <tr>
-      <th>Risk Assessment Form Filled?</th>
-      <td><?php echo esc_html($req->risk_form_filled ?: '—'); ?></td>
-    </tr>
-    <tr>
-      <th>Any Special Processes?</th>
-      <td><?php echo esc_html($req->special_processes ?: '—'); ?></td>
-    </tr>
-    <tr>
-      <th>Test Received &amp; Reviewed?</th>
-      <td><?php echo esc_html($req->test_received_reviewed ?: '—'); ?></td>
-    </tr>
-    <tr>
-      <th>Test Object Accepted?</th>
-      <td><?php echo esc_html($req->test_object_accepted ?: '—'); ?></td>
-    </tr>
-    <tr>
-      <th>Accepted By</th>
-      <td><?php echo esc_html($req->test_accepted_by ?: '—'); ?></td>
-    </tr>
-  </table>
   <?php endif; ?>
-  <?php endif; ?>
-
-</div>
-</div>
+</div> <!-- /request-card -->
+</div> <!-- /container -->
 <?php
         else: echo "<p style='text-align:center;color:#dc3545;padding:50px;'>Request not found.</p>"; endif;
 
@@ -3737,20 +4525,20 @@ if (!empty($_uhv_errs)) {
         $my_requests  = array_filter((array)$all_my, fn($r) => $r->status !== 'draft_indenter');
         $has_approved = !empty($latest_approved_id);
 
-        // Stats counts for Indenter (Aligned with CATVAC logic)
-        $ind_cnt_pending   = count(array_filter((array)$my_requests, fn($r) => in_array($r->status, ['pending', 'pending_qa'])));
+        // Stats counts for User (Aligned with CATVAC logic)
+        $ind_cnt_pending   = count(array_filter((array)$my_requests, fn($r) => in_array($r->status, ['pending_qa','pending_staff','pending_manager','pending'])));
         $ind_cnt_testing   = count(array_filter((array)$my_requests, fn($r) => in_array($r->status, ['approved', 'in_testing'])));
         $ind_cnt_rejected  = count(array_filter((array)$my_requests, fn($r) => in_array($r->status, ['rejected', 'qa_rejected', 'manager_returned', 'recheck_indenter'])));
         $ind_cnt_completed = count(array_filter((array)$my_requests, fn($r) => $r->status === 'completed'));
         
         $my_qa_pending_count = (int)$wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(*) FROM {$table} WHERE qa_stno=%s AND (status='pending_qa' OR (status='pending' AND qa_decision=''))",
+            "SELECT COUNT(*) FROM {$table} WHERE qa_stno=%s AND (status='pending_qa' OR (status IN ('pending_manager','pending') AND qa_decision=''))",
             $emp->stno
         ));
 
         $uhv_msg    = sanitize_text_field($_GET['uhv_msg'] ?? ''); ?>
 <div class="container">
-<div class="role-indicator">INDENTER VIEW | <?php echo esc_html($emp->name.' ('.$emp->stno.')'); ?></div>
+<div class="role-indicator">USER VIEW | <?php echo esc_html($emp->name.' ('.$emp->stno.')'); ?></div>
 
 <?php if ($uhv_msg === 'draft_saved'): ?>
 <div style="background:#d1ecf1;color:#0c5460;border:1px solid #bee5eb;padding:16px 22px;margin-bottom:25px;border-radius:4px;font-size:15px;">
@@ -3762,12 +4550,12 @@ if (!empty($_uhv_errs)) {
 </div>
 <?php endif; ?>
 
-<?php uhv_indenter_stat_cards($ind_cnt_pending, $my_qa_pending_count, $ind_cnt_testing, $ind_cnt_rejected, $ind_cnt_completed); ?>
+<?php uhv_user_stat_cards($ind_cnt_pending, $my_qa_pending_count, $ind_cnt_testing, $ind_cnt_rejected, $ind_cnt_completed); ?>
 
 <h1>My UHV Requests</h1>
 <div style="margin-bottom:25px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
   <!-- Left: New Test Request button (unchanged) -->
-  <a href="<?php echo add_query_arg('action','create_new'); ?>" class="btn btn-success">+ NEW TEST REQUEST</a>
+  <a href="<?php echo esc_url(remove_query_arg('resume_draft', add_query_arg('action','create_new'))); ?>" class="btn btn-success">+ NEW TEST REQUEST</a>
 
   <!-- Right: View Staff Form + QA Review buttons -->
   <?php uhv_dashboard_buttons($emp); ?>
@@ -3784,7 +4572,7 @@ if (!empty($_uhv_errs)) {
 
 <?php if (!empty($my_drafts)): ?>
 <h3 style="margin-bottom:12px;">&#128203; Saved Drafts</h3>
-<table class="list-table" id="table-indenter-drafts" style="margin-bottom:35px;">
+<table class="list-table" id="table-user-drafts" style="margin-bottom:35px;">
   <thead><tr><th>Test Object</th><th>Last Saved</th><th>Action</th></tr></thead>
   <tbody>
   <?php foreach($my_drafts as $dr): ?>
@@ -3810,7 +4598,7 @@ if (!empty($_uhv_errs)) {
 <?php else: ?>
 
 <h3 style="margin-bottom:12px;">Submitted Requests</h3>
-<table class="list-table" id="table-indenter-requests">
+<table class="list-table" id="table-user-requests">
   <thead>
     <tr>
       <th>TR No.</th>
@@ -3838,7 +4626,7 @@ if (!empty($_uhv_errs)) {
     <td><?php echo $tr_display; ?></td>
     <td><?php echo esc_html($req->satellite_name); ?></td>
     <td><?php echo date('d M Y, h:i A', strtotime($req->submission_date)); ?></td>
-    <td><span class="badge <?php echo $bc; ?>"><?php echo strtoupper($req->status); ?></span></td>
+    <td><span class="badge <?php echo $bc; ?>"><?php echo ($req->status==='recheck_indenter') ? 'SENT BACK' : strtoupper($req->status); ?></span></td>
     <td style="white-space:nowrap;">
       <a href="<?php echo add_query_arg('view_id',$req->id); ?>" class="btn btn-view" style="margin-right:4px;">View Details</a>
       <?php if(in_array($req->status, ['qa_rejected','rejected'])): ?>
@@ -3955,6 +4743,7 @@ if ($user_role === 'qa_engineer') {
     <?php endif; ?>
   </table>
   <?php uhv_render_test_subforms_readonly($req); ?>
+  <?php uhv_render_per_test_risk_readonly($req, 'Staff Risk Assessment (Per Test)'); ?>
 
   <!-- QA REVIEW FORM -->
   <form method="post" style="margin-top:30px;">
@@ -3989,13 +4778,13 @@ if ($user_role === 'qa_engineer') {
         </button>
         <button type="submit" name="qa_decision" value="reject"
           class="btn btn-reject" style="padding:14px 36px;font-size:14px;"
-          onclick="return confirm('Reject and return this request to the Indenter?')">
-          ✗ REJECT &amp; RETURN TO INDENTER
+          onclick="return confirm('Reject and return this request to the User?')">
+          ✗ REJECT &amp; RETURN TO USER
         </button>
       </div>
       <p style="font-size:13px;color:#666;margin-top:14px;">
         <strong>Accept</strong> → Request forwarded to Manager for approval &nbsp;|&nbsp;
-        <strong>Reject</strong> → Request returned to Indenter with your remarks
+        <strong>Reject</strong> → Request returned to User with your remarks
       </p>
     </div>
   </form>
@@ -4027,7 +4816,7 @@ if ($user_role === 'qa_engineer') {
 </div>
 <?php elseif ($uhv_msg === 'qa_rejected'): ?>
 <div style="background:#fff3cd;color:#856404;border:1px solid #ffc107;padding:14px 20px;margin-bottom:20px;border-radius:4px;">
-  ✓ <strong>Request rejected and returned to the Indenter with your remarks.</strong>
+  ✓ <strong>Request rejected and returned to the User with your remarks.</strong>
 </div>
 <?php endif; ?>
 
@@ -4098,6 +4887,7 @@ if ($user_role === 'qa_engineer') {
       <th>TR No.</th>
       <th>Test Object</th>
       <th>Submitted By</th>
+      <th>Submitted Date</th>
       <th>Decision</th>
       <th>Review Date</th>
       <th>Remarks</th>
@@ -4121,6 +4911,7 @@ if ($user_role === 'qa_engineer') {
     </td>
     <td><?php echo esc_html($req->satellite_name); ?></td>
     <td><?php echo esc_html($req->sub_name); ?></td>
+    <td><?php echo !empty($req->submission_date) ? date('d M Y, h:i A', strtotime($req->submission_date)) : '—'; ?></td>
     <td><?php echo $dec_badge; ?></td>
     <td><?php echo !empty($req->qa_review_date) ? date('d M Y, h:i A', strtotime($req->qa_review_date)) : '—'; ?></td>
     <td style="max-width:200px;font-size:13px;color:#555;"><?php echo esc_html($req->qa_remarks ?: '—'); ?></td>
@@ -4143,7 +4934,7 @@ if ($user_role === 'qa_engineer') {
     $view_id    = intval($_GET['view_id'] ?? 0);
     $prog_id    = intval($_GET['prog_id'] ?? 0);
 
-    $cnt_pending    = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$table} WHERE status='pending'");
+    $cnt_pending    = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$table} WHERE status IN ('pending_manager','pending')");
     $cnt_approved   = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$table} WHERE status='approved'");
     $cnt_rejected   = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$table} WHERE status='rejected'");
     $cnt_completed  = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$table} WHERE status='completed'");
@@ -4172,7 +4963,7 @@ if ($user_role === 'qa_engineer') {
         // Manager logic:
         // 'pending'                          → Manager sees indenter form, gives decision
         // 'approved'/'rejected'/'completed'  → Read-only summary view
-        $show_decision_form = ($req->status === 'pending');
+        $show_decision_form = ($req->status === 'pending_manager');
         $show_readonly      = in_array($req->status, ['approved','rejected','completed','in_testing']);
         $show_readonly      = in_array($req->status, ['approved','rejected','completed','in_testing']);
 
@@ -4183,6 +4974,7 @@ if ($user_role === 'qa_engineer') {
 <div class="role-indicator">MANAGER VIEW | <?php echo esc_html($emp->name.' ('.$emp->stno.')'); ?></div>
 <div style="margin-bottom:25px;display:flex;gap:10px;align-items:center;">
   <a href="<?php echo get_permalink(); ?>" class="btn btn-primary">← Back to Dashboard</a>
+  <?php uhv_print_button($req->id); ?>
   <?php uhv_history_button($req->id); ?>
 </div>
 
@@ -4226,7 +5018,7 @@ if ($uhv_msg_v === 'decision_saved'): ?>
 
   <!-- ══ INDENTER REQUEST DETAILS (always visible, read-only) ══ -->
   <div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:20px 25px;margin:20px 0;">
-    <h3 style="margin-top:0;color:#343a40;font-size:16px;">📋 INDENTER REQUEST DETAILS <span style="font-size:12px;font-weight:400;color:#6c757d;">(Read-Only)</span></h3>
+    <h3 style="margin-top:0;color:#343a40;font-size:16px;">📋 USER REQUEST DETAILS <span style="font-size:12px;font-weight:400;color:#6c757d;">(Read-Only)</span></h3>
 
     <table style="width:100%;border-collapse:collapse;font-size:14px;">
       <tr><th style="border:1px solid #ccc;padding:10px;background:#e9ecef;width:22%;">Test Object</th><td style="border:1px solid #ccc;padding:10px;"><?php echo esc_html($req->satellite_name); ?></td><th style="border:1px solid #ccc;padding:10px;background:#e9ecef;width:22%;">Test Type</th><td style="border:1px solid #ccc;padding:10px;"><?php echo esc_html(!empty($req->test_types) ? $req->test_types : $req->test_type); ?></td></tr>
@@ -4241,6 +5033,7 @@ if ($uhv_msg_v === 'decision_saved'): ?>
       <?php endif; ?>
     </table>
     <?php uhv_render_test_subforms_readonly($req); ?>
+  <?php uhv_render_per_test_risk_readonly($req, 'Staff Risk Assessment (Per Test)'); ?>
 
     <?php if (!empty($req->qa_reviewer_name)): ?>
     <h3 style="margin-top:18px;font-size:15px;color:#343a40;">QA / T&amp;E Engineer Review</h3>
@@ -4255,74 +5048,27 @@ if ($uhv_msg_v === 'decision_saved'): ?>
   <!-- ══ STEP 1: MANAGER DECISION FORM ══ -->
   <div style="background:#fff8e1;border:2px solid #ffc107;border-radius:6px;padding:25px;margin:20px 0;">
     <h3 style="margin-top:0;color:#856404;font-size:16px;">⚖️ MANAGER DECISION</h3>
-    <p style="color:#555;font-size:14px;margin:0 0 18px 0;">Review the indenter's request above. Fill the Pre-Test Assessment, enter your remarks, and choose an action. A comment is <strong>mandatory</strong> for Reject and Send for Review.</p>
+    <p style="color:#555;font-size:14px;margin:0 0 18px 0;">Review the user's request above. Fill the Pre-Test Assessment, enter your remarks, and choose an action. A comment is <strong>mandatory</strong> for Reject and Send for Review.</p>
     <form method="post" enctype="multipart/form-data">
       <?php wp_nonce_field('uhv_action','uhv_nonce'); ?>
       <input type="hidden" name="form_id" value="<?php echo $req->id; ?>">
 
-      <!-- SECTION A: Stacked Vertical Table Layout -->
-      <h3 style="margin-top:25px;font-size:15px;color:#856404;">Section A — Pre-Test Assessment</h3>
-      <div style="background:#fff;border:1px solid #000;padding:0;margin-bottom:20px;">
-        <table style="width:100%;border-collapse:collapse;">
-          <!-- Row 1: Test Request Received -->
-          <tr>
-            <th style="border:1px solid #000;padding:12px;background:#f9f9f9;text-align:left;font-weight:600;width:50%;">
-              Test request received, reviewed and accepted for testing
-            </th>
-            <td style="border:1px solid #000;padding:12px;text-align:center;">
-              <input type="hidden" name="test_object_accepted" id="testobjectaccepted_val" value="<?php echo esc_attr(ucfirst(strtolower($req->test_object_accepted ?? ''))); ?>">
-              <label class="uniform-check-label"><input type="checkbox" class="uniform-check-input" id="testobjectaccepted_yes" <?php echo (strtolower($req->test_object_accepted ?? '') === 'yes') ? 'checked' : ''; ?> onchange="uhvToggleCb(this,'testobjectaccepted_no','testobjectaccepted_val','Yes')"> Yes</label>
-              <label class="uniform-check-label"><input type="checkbox" class="uniform-check-input" id="testobjectaccepted_no" <?php echo (strtolower($req->test_object_accepted ?? '') === 'no') ? 'checked' : ''; ?> onchange="uhvToggleCb(this,'testobjectaccepted_yes','testobjectaccepted_val','No')"> No</label>
-            </td>
-          </tr>
-          <!-- Row 2: Risk Assessed -->
-          <tr>
-            <th style="border:1px solid #000;padding:12px;background:#f9f9f9;text-align:left;font-weight:600;">
-              Risk Assessed as per Online QMS UHV Lab Risk Table
-            </th>
-            <td style="border:1px solid #000;padding:12px;text-align:center;">
-                <input type="hidden" name="risk_assessed_uhv" id="riskassesseduhv_val" value="<?php echo esc_attr(ucfirst(strtolower($req->risk_assessed_uhv ?? ''))); ?>">
-                <label class="uniform-check-label"><input type="checkbox" class="uniform-check-input" id="riskassesseduhv_yes" <?php echo (strtolower($req->risk_assessed_uhv ?? '') === 'yes') ? 'checked' : ''; ?> onchange="uhvToggleCb(this,'riskassesseduhv_no','riskassesseduhv_val','Yes')"> Yes</label>
-                <label class="uniform-check-label"><input type="checkbox" class="uniform-check-input" id="riskassesseduhv_no" <?php echo (strtolower($req->risk_assessed_uhv ?? '') === 'no') ? 'checked' : ''; ?> onchange="uhvToggleCb(this,'riskassesseduhv_yes','riskassesseduhv_val','No')"> No</label>
-            </td>
-          </tr>
-          <!-- Row 3: RPN -->
-          <tr>
-            <th style="border:1px solid #000;padding:12px;background:#f9f9f9;text-align:left;font-weight:600;">
-              Risk Priority No.(RPN)
-            </th>
-            <td style="border:1px solid #000;padding:12px;">
-              <input type="hidden" name="rpn_uhv" id="rpnuhv_val" value="<?php echo esc_attr($req->rpn_uhv ?? ''); ?>">
-              <label class="uniform-check-label"><input type="checkbox" class="uniform-check-input" id="rpnuhv_lt4" <?php echo (isset($req->rpn_uhv) && $req->rpn_uhv === 'lt4') ? 'checked' : ''; ?> onchange="uhvToggleCb(this,'rpnuhv_gte5','rpnuhv_val','lt4'); document.getElementById('mgr_rpn_file_box').style.display='none';"> &le; 4</label>
-              <label class="uniform-check-label"><input type="checkbox" class="uniform-check-input" id="rpnuhv_gte5" <?php echo (isset($req->rpn_uhv) && $req->rpn_uhv === 'gte5') ? 'checked' : ''; ?> onchange="uhvToggleCb(this,'rpnuhv_lt4','rpnuhv_val','gte5'); document.getElementById('mgr_rpn_file_box').style.display=this.checked?'block':'none';"> &ge; 5</label>
-              
-              <div id="mgr_rpn_file_box" style="margin-top:10px;display:<?php echo (isset($req->rpn_uhv) && $req->rpn_uhv === 'gte5') ? 'block' : 'none'; ?>;border:1px dashed #ccc;padding:8px;">
-                <small style="display:block;margin-bottom:5px;color:#d9534f;">(as per online QMS Risk Table to be filled if RPN &ge; 5)</small>
-                <input type="file" name="risk_assessment_file" accept=".pdf,.doc,.docx,.jpg,.jpeg,.png" style="font-size:12px;">
-                <?php if (!empty($req->risk_form_file)): ?>
-                  <div style="font-size:11px;margin-top:4px;"><a href="<?php echo esc_url($req->risk_form_file); ?>" target="_blank">View Existing File</a></div>
-                <?php endif; ?>
-              </div>
-            </td>
-          </tr>
-          <!-- Row 4: Risk Record -->
-          <tr>
-            <th style="border:1px solid #000;padding:12px;background:#f9f9f9;text-align:left;font-weight:600;">
-              Risk Record
-            </th>
-            <td style="border:1px solid #000;padding:12px;">
-                <input type="hidden" name="risk_record_uhv" id="riskrecorduhv_val" value="<?php echo esc_attr($req->risk_record_uhv ?? 'na'); ?>">
-                <label class="uniform-check-label"><input type="checkbox" class="uniform-check-input" id="riskrecorduhv_yes" <?php echo ($req->risk_record_uhv==='yes')?'checked':''; ?> onchange="uhvToggleMultiCb(this,['riskrecorduhv_no','riskrecorduhv_na'],'riskrecorduhv_val','yes')"> Yes</label>
-                <label class="uniform-check-label"><input type="checkbox" class="uniform-check-input" id="riskrecorduhv_no" <?php echo ($req->risk_record_uhv==='no')?'checked':''; ?> onchange="uhvToggleMultiCb(this,['riskrecorduhv_yes','riskrecorduhv_na'],'riskrecorduhv_val','no')"> No</label>
-                <label class="uniform-check-label"><input type="checkbox" class="uniform-check-input" id="riskrecorduhv_na" <?php echo (!$req->risk_record_uhv || $req->risk_record_uhv==='na')?'checked':''; ?> onchange="uhvToggleMultiCb(this,['riskrecorduhv_yes','riskrecorduhv_no'],'riskrecorduhv_val','na')"> NA</label>
-            </td>
-          </tr>
-        </table>
+      <!-- Overhaul: Section A is now read-only for Manager, as it was filled by Staff -->
+      <div style="background:#f1f8e9;border:1px solid #2e7d32;padding:15px;margin-bottom:20px;border-radius:4px;">
+        <h4 style="margin-top:0;color:#2e7d32;font-size:15px;">🔍 Staff Risk Assessment Result</h4>
+        <?php uhv_render_per_test_risk_readonly($req, ''); ?>
+        
+        <div style="margin-top:10px;padding-top:10px;border-top:1px dashed #2e7d32;">
+          <label style="font-weight:600;font-size:13px;color:#2e7d32;display:block;margin-bottom:5px;">Upload Final Risk Record (Optional):</label>
+          <input type="file" name="risk_assessment_file" accept=".pdf,.doc,.docx,.jpg,.jpeg,.png" style="font-size:12px;">
+          <?php if (!empty($req->risk_form_file)): ?>
+            <div style="font-size:11px;margin-top:4px;"><a href="<?php echo esc_url($req->risk_form_file); ?>" target="_blank">View Existing File</a></div>
+          <?php endif; ?>
+        </div>
       </div>
-      <!-- END SECTION A -->
 
       <label style="font-weight:600;display:block;margin-bottom:6px;font-size:14px;">Manager Remarks / Comments <span style="color:#dc3545;">*</span> <span style="font-weight:400;color:#6c757d;font-size:12px;">(required for Reject / Send for Review)</span></label>
-      <textarea name="manager_comment" rows="4" placeholder="Enter your remarks, decision rationale, or instructions for the indenter..." style="width:100%;border:1px solid #000;padding:12px;font-size:14px;font-family:inherit;border-radius:4px;resize:vertical;"><?php echo esc_textarea($req->manager_comment ?? ''); ?></textarea>
+      <textarea name="manager_comment" rows="4" placeholder="Enter your remarks, decision rationale, or instructions for the user..." style="width:100%;border:1px solid #000;padding:12px;font-size:14px;font-family:inherit;border-radius:4px;resize:vertical;"><?php echo esc_textarea($req->manager_comment ?? ''); ?></textarea>
       <div style="margin-top:18px;display:flex;gap:12px;flex-wrap:wrap;align-items:center;">
         <button type="submit" name="action_type" value="approve"
                 style="padding:14px 36px;background:#28a745;color:#fff;border:none;cursor:pointer;font-weight:700;font-size:18px;border-radius:4px;letter-spacing:.5px;"
@@ -4337,7 +5083,7 @@ if ($uhv_msg_v === 'decision_saved'): ?>
         <button type="submit" name="action_type" value="recheck"
                 style="padding:14px 36px;background:#fd7e14;color:#fff;border:none;cursor:pointer;font-weight:700;font-size:18px;border-radius:4px;letter-spacing:.5px;"
                 onclick="return validateMgrComment(this)">
-          ↩ SEND FOR REVIEW
+          ↩ RECHECK TO STAFF
         </button>
       </div>
     </form>
@@ -4346,7 +5092,7 @@ if ($uhv_msg_v === 'decision_saved'): ?>
   function validateMgrComment(btn) {
     var ta = btn.closest('form').querySelector('[name="manager_comment"]');
     if (!ta.value.trim()) { alert('Please enter remarks/comments before ' + (btn.value==='reject'?'rejecting':'sending for review') + '.'); ta.focus(); return false; }
-    return confirm('Are you sure you want to ' + (btn.value==='reject'?'REJECT this request?':'send this request BACK TO THE INDENTER for review?'));
+    return confirm('Are you sure you want to ' + (btn.value==='reject'?'REJECT this request?':'send this request BACK TO STAFF for recheck?'));
   }
   </script>
 
@@ -4366,40 +5112,6 @@ if ($uhv_msg_v === 'decision_saved'): ?>
     </table>
   </div>
 
-    <?php if ($req->status === 'approved' || $req->status === 'completed' || $req->status === 'in_testing'): ?>
-    <!-- SECTION A (Pre-Test Assessment Filled by Manager) -->
-    <h3 style="margin-top:25px;font-size:18px;color:#343a40;">Section A — Pre-Test Assessment <span style="font-size:14px;font-weight:400;color:#6c757d;">(Filled by Manager)</span></h3>
-    <table style="width:100%;border-collapse:collapse;font-size:17px;margin-bottom:22px;background:#fff;border:1px solid #000;">
-      <!-- Row 1: Test Request Received -->
-      <tr>
-        <th style="border:1px solid #000;padding:12px;background:#e9ecef;text-align:left;width:50%;">Test request received, reviewed and accepted for testing</th>
-        <td style="border:1px solid #000;padding:12px;text-align:center;"><?php echo esc_html($req->test_object_accepted ?: '—'); ?></td>
-      </tr>
-      <!-- Row 2: Risk Assessed -->
-      <tr>
-        <th style="border:1px solid #000;padding:12px;background:#e9ecef;text-align:left;">Risk Assessed as per Online QMS UHV Lab Risk Table</th>
-        <td style="border:1px solid #000;padding:12px;text-align:center;"><?php echo esc_html($req->risk_assessed_uhv ?: '—'); ?></td>
-      </tr>
-      <!-- Row 3: RPN -->
-      <tr>
-        <th style="border:1px solid #000;padding:12px;background:#e9ecef;text-align:left;">Risk Priority No.(RPN)</th>
-        <td style="border:1px solid #000;padding:12px;">
-          <strong><?php 
-            $rv = $req->rpn_uhv ?? '';
-            echo $rv === 'lt4' ? '≤ 4 (Low Risk)' : ($rv === 'gte5' ? '≥ 5 (High Risk)' : '—'); 
-          ?></strong>
-          <?php if ($rv === 'gte5' && !empty($req->risk_form_file)): ?>
-            <br><a href="<?php echo esc_url($req->risk_form_file); ?>" target="_blank" style="font-size:12px;color:#28a745;">&#128206; View Risk Assessment File</a>
-          <?php endif; ?>
-        </td>
-      </tr>
-      <!-- Row 4: Risk Record -->
-      <tr>
-        <th style="border:1px solid #000;padding:12px;background:#e9ecef;text-align:left;">Risk Record</th>
-        <td style="border:1px solid #000;padding:12px;"><strong><?php echo strtoupper($req->risk_record_uhv ?: 'NA'); ?></strong></td>
-      </tr>
-    </table>
-    <?php endif; ?>
 
   <?php endif; // end show_readonly ?>
 
@@ -4523,7 +5235,7 @@ if ($uhv_msg_v === 'decision_saved'): ?>
             $existing_draft = null;
         } ?>
 <div class="form-container">
-<div class="role-indicator">INDENTER VIEW | <?php echo esc_html($emp->name.' ('.$emp->stno.')'); ?></div>
+<div class="role-indicator">USER VIEW | <?php echo esc_html($emp->name.' ('.$emp->stno.')'); ?></div>
 <div style="margin-bottom:25px;"><a href="<?php echo get_permalink(); ?>" class="btn btn-primary">&larr; Back to Dashboard</a></div>
 <h1>New Request Submission</h1>
 <?php
@@ -4563,7 +5275,7 @@ if (!empty($_uhv_errs)) {
     $tr_display = (strpos($req->test_requisition_no,'PENDING-')===0||strpos($req->test_requisition_no,'DRAFT-')===0)
         ? '<em style="color:#999;font-size:12px;">—</em>'
         : '<strong>'.esc_html($req->test_requisition_no).'</strong>';
-    $status_label = strtoupper(str_replace('_',' ',$req->status));
+    $status_label = ($req->status==='recheck_indenter') ? 'SENT BACK' : strtoupper(str_replace('_',' ',$req->status));
   ?>
   <tr>
     <td><?php echo $tr_display; ?></td>
@@ -4644,7 +5356,7 @@ if (!empty($_uhv_errs)) {
 <?php
 
     } elseif ($mgr_action === 'pending') {
-        $pending = $wpdb->get_results($wpdb->prepare("SELECT * FROM {$table} WHERE status=%s ORDER BY submission_date DESC", 'pending')); ?>
+        $pending = $wpdb->get_results("SELECT * FROM {$table} WHERE status IN ('pending_manager','pending') ORDER BY submission_date DESC"); ?>
 <div class="container">
 <div class="role-indicator">MANAGER VIEW | <?php echo esc_html($emp->name.' ('.$emp->stno.')'); ?></div>
 <?php mgr_stat_cards($cnt_pending,$cnt_approved,$cnt_rejected,$cnt_completed,$cnt_my_qa_pending); ?>
@@ -4680,14 +5392,14 @@ if (!empty($_uhv_errs)) {
 <div style="text-align:center;padding:60px;color:#666;border:2px solid #ddd;border-radius:6px;"><h3 style="margin:0;">No requests currently in testing</h3></div>
 <?php else: ?>
 <table class="list-table" id="table-mgr-in-testing">
-  <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Approved On</th><th>Test Required On</th><th>Action</th></tr></thead>
+  <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Submitted Date</th><th>Approved On</th><th>Test Required On</th><th>Action</th></tr></thead>
   <tbody>
   <?php foreach($rows as $req): ?>
   <tr>
     <td><strong><?php echo esc_html($req->test_requisition_no); ?></strong></td>
     <td><?php echo esc_html($req->satellite_name); ?></td>
-    <td><?php echo esc_html($req->project_program); ?></td>
     <td><?php echo esc_html($req->sub_name); ?></td>
+    <td><?php echo !empty($req->submission_date) ? date('d M Y, h:i A', strtotime($req->submission_date)) : '—'; ?></td>
     <td><?php echo !empty($req->approval_date) ? date('d M Y', strtotime($req->approval_date)) : '—'; ?></td>
     <td><?php echo !empty($req->test_required_on) ? date('d M Y', strtotime($req->test_required_on)) : '—'; ?></td>
     <td><a href="?view_id=<?php echo $req->id; ?>" class="btn btn-view">VIEW DETAILS</a></td>
@@ -4710,14 +5422,14 @@ if (!empty($_uhv_errs)) {
 <div style="text-align:center;padding:60px;color:#666;border:2px solid #ddd;border-radius:6px;"><h3 style="margin:0;">No rejected requests</h3></div>
 <?php else: ?>
 <table class="list-table" id="table-mgr-rejected">
-  <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Rejected On</th><th>Manager Comments</th><th>Action</th></tr></thead>
+  <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Submitted Date</th><th>Rejected On</th><th>Manager Comments</th><th>Action</th></tr></thead>
   <tbody>
   <?php foreach($rows as $req): ?>
   <tr>
     <td><strong><?php echo esc_html($req->test_requisition_no); ?></strong></td>
     <td><?php echo esc_html($req->satellite_name); ?></td>
-    <td><?php echo esc_html($req->project_program); ?></td>
     <td><?php echo esc_html($req->sub_name); ?></td>
+    <td><?php echo !empty($req->submission_date) ? date('d M Y, h:i A', strtotime($req->submission_date)) : '—'; ?></td>
     <td><?php echo !empty($req->approval_date) ? date('d M Y', strtotime($req->approval_date)) : '—'; ?></td>
     <td style="max-width:220px;font-size:13px;color:#555;"><?php echo esc_html($req->manager_comment ?: '—'); ?></td>
     <td><a href="?view_id=<?php echo $req->id; ?>" class="btn btn-view">VIEW DETAILS</a></td>
@@ -4740,14 +5452,14 @@ if (!empty($_uhv_errs)) {
 <div style="text-align:center;padding:60px;color:#666;border:2px solid #ddd;border-radius:6px;"><h3 style="margin:0;">No completed tests yet</h3></div>
 <?php else: ?>
 <table class="list-table" id="table-mgr-completed-full">
-  <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Approved On</th><th>Completed On</th><th>Action</th></tr></thead>
+  <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Submitted Date</th><th>Approved On</th><th>Completed On</th><th>Action</th></tr></thead>
   <tbody>
   <?php foreach($rows as $req): ?>
   <tr>
     <td><strong><?php echo esc_html($req->test_requisition_no); ?></strong></td>
     <td><?php echo esc_html($req->satellite_name); ?></td>
-    <td><?php echo esc_html($req->project_program); ?></td>
     <td><?php echo esc_html($req->sub_name); ?></td>
+    <td><?php echo !empty($req->submission_date) ? date('d M Y, h:i A', strtotime($req->submission_date)) : '—'; ?></td>
     <td><?php echo !empty($req->approval_date) ? date('d M Y', strtotime($req->approval_date)) : '—'; ?></td>
     <td><?php echo !empty($req->completion_date) ? date('d M Y', strtotime($req->completion_date)) : '—'; ?></td>
     <td><a href="?view_id=<?php echo $req->id; ?>" class="btn btn-view">VIEW DETAILS</a></td>
@@ -4819,6 +5531,7 @@ if (!empty($_uhv_errs)) {
     <?php if (!empty($req->special_requirements)): ?><tr><th>Special Requirements</th><td colspan="3" style="background:#fff3cd;"><?php echo nl2br(esc_html($req->special_requirements)); ?></td></tr><?php endif; ?>
   </table>
   <?php uhv_render_test_subforms_readonly($req); ?>
+  <?php uhv_render_per_test_risk_readonly($req, 'Staff Risk Assessment (Per Test)'); ?>
 
   <form method="post" style="margin-top:30px;">
     <?php wp_nonce_field('uhv_action','uhv_nonce'); ?>
@@ -4837,9 +5550,9 @@ if (!empty($_uhv_errs)) {
       </table>
       <div style="display:flex;gap:16px;flex-wrap:wrap;">
         <button type="submit" name="qa_decision" value="accept" class="btn btn-approve" onclick="return confirm('Accept and forward to Manager queue?')">&#10003; ACCEPT &amp; FORWARD TO APPROVAL</button>
-        <button type="submit" name="qa_decision" value="reject" class="btn btn-reject" onclick="return confirm('Reject and return to Indenter?')">&#10007; REJECT &amp; RETURN TO INDENTER</button>
+        <button type="submit" name="qa_decision" value="reject" class="btn btn-reject" onclick="return confirm('Reject and return to User?')">&#10007; REJECT &amp; RETURN TO USER</button>
       </div>
-      <p style="font-size:13px;color:#666;margin-top:14px;"><strong>Accept</strong> &rarr; moves to Pending Approval queue &nbsp;|&nbsp; <strong>Reject</strong> &rarr; returned to Indenter with your remarks</p>
+      <p style="font-size:13px;color:#666;margin-top:14px;"><strong>Accept</strong> &rarr; moves to Pending Approval queue &nbsp;|&nbsp; <strong>Reject</strong> &rarr; returned to User with your remarks</p>
     </div>
   </form>
 </div>
@@ -4856,7 +5569,7 @@ if (!empty($_uhv_errs)) {
 <?php if ($uhv_msg_qa === 'qa_accepted'): ?>
 <div style="background:#d4edda;color:#155724;border:1px solid #c3e6cb;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#10003; <strong>Accepted &amp; forwarded to the approval queue.</strong></div>
 <?php elseif ($uhv_msg_qa === 'qa_rejected'): ?>
-<div style="background:#fff3cd;color:#856404;border:1px solid #ffc107;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#10003; <strong>Rejected and returned to the indenter with your remarks.</strong></div>
+<div style="background:#fff3cd;color:#856404;border:1px solid #ffc107;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#10003; <strong>Rejected and returned to the user with your remarks.</strong></div>
 <?php endif; ?>
 <?php mgr_stat_cards($cnt_pending,$cnt_approved,$cnt_rejected,$cnt_completed,$cnt_my_qa_pending); ?>
 <?php mgr_tabs('qa_review', $cnt_pending, $cnt_my_qa_pending); ?>
@@ -4890,7 +5603,7 @@ if (!empty($_uhv_errs)) {
 <?php if (!empty($my_qa_reviewed)): ?>
 <h2 style="font-size:18px;margin:25px 0 12px;">&#128203; My QA Review History</h2>
 <table class="list-table" id="table-mgr-qa-history">
-  <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Decision</th><th>Review Date</th><th>Remarks</th><th>Action</th></tr></thead>
+  <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Submitted Date</th><th>Decision</th><th>Review Date</th><th>Remarks</th><th>Action</th></tr></thead>
   <tbody>
   <?php foreach ($my_qa_reviewed as $_qrh):
     $_dec = ($_qrh->qa_decision==='accept')
@@ -4904,6 +5617,7 @@ if (!empty($_uhv_errs)) {
     <td><?php echo $_tr; ?></td>
     <td><?php echo esc_html($_qrh->satellite_name); ?></td>
     <td><?php echo esc_html($_qrh->sub_name); ?></td>
+    <td><?php echo !empty($_qrh->submission_date) ? date('d M Y, h:i A', strtotime($_qrh->submission_date)) : '—'; ?></td>
     <td><?php echo $_dec; ?></td>
     <td><?php echo !empty($_qrh->qa_review_date)?date('d M Y, h:i A',strtotime($_qrh->qa_review_date)):'&mdash;'; ?></td>
     <td style="max-width:200px;font-size:13px;color:#555;"><?php echo esc_html($_qrh->qa_remarks?:'&mdash;'); ?></td>
@@ -4918,16 +5632,21 @@ if (!empty($_uhv_errs)) {
         } // end qa_view_id else
 
     } else {
-        $recent_all  = $wpdb->get_results("SELECT * FROM {$table} ORDER BY submission_date DESC LIMIT 6"); ?>
+        $recent_all  = $wpdb->get_results("SELECT * FROM {$table} ORDER BY submission_date DESC LIMIT 6");
+        $my_drafts   = $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM {$table} WHERE user_id = %d AND status = 'draft_indenter' ORDER BY id DESC",
+            $user->ID
+        ));
+?>
 <div class="container">
 <div class="role-indicator">MANAGER VIEW | <?php echo esc_html($emp->name.' ('.$emp->stno.')'); ?></div>
 <?php $uhv_msg = sanitize_text_field($_GET['uhv_msg'] ?? '');
 if ($uhv_msg === 'approved'): ?>
 <div style="background:#d4edda;color:#155724;border:1px solid #c3e6cb;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#10003; <strong>Request approved successfully.</strong> Test Requisition Number has been assigned and UHV staff have been notified.</div>
 <?php elseif ($uhv_msg === 'rejected'): ?>
-<div style="background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#10003; <strong>Request rejected.</strong> The indenter has been notified.</div>
+<div style="background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#10003; <strong>Request rejected.</strong> The user has been notified.</div>
 <?php elseif ($uhv_msg === 'recheck_sent'): ?>
-<div style="background:#fff3cd;color:#856404;border:1px solid #ffc107;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#8617; <strong>Request sent back to the Indenter for review/editing.</strong> They have been notified.</div>
+<div style="background:#fff3cd;color:#856404;border:1px solid #ffc107;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#8617; <strong>Request sent back to the User for review/editing.</strong> They have been notified.</div>
 <?php elseif ($uhv_msg === 'submitted'): ?>
 <div style="background:#d4edda;color:#155724;border:1px solid #c3e6cb;padding:16px 22px;margin-bottom:25px;border-radius:4px;font-size:15px;">
   &#10003; <strong>Request submitted successfully.</strong> A Test Requisition Number will be assigned upon manager approval.
@@ -4940,15 +5659,33 @@ if ($uhv_msg === 'approved'): ?>
 <?php mgr_stat_cards($cnt_pending,$cnt_approved,$cnt_rejected,$cnt_completed,$cnt_my_qa_pending); ?>
 <?php mgr_tabs('dashboard', $cnt_pending, $cnt_my_qa_pending); ?>
 
+<?php if (!empty($my_drafts)): ?>
+<h3 style="margin-bottom:12px;">&#128203; My Saved Drafts</h3>
+<table class="list-table" id="table-mgr-drafts" style="margin-bottom:35px;">
+  <thead><tr><th>Test Object</th><th>Last Saved</th><th>Action</th></tr></thead>
+  <tbody>
+  <?php foreach($my_drafts as $dr): ?>
+  <tr style="background:#fffdf0;">
+    <td><?php echo esc_html($dr->satellite_name ?: '(Untitled)'); ?></td>
+    <td><?php echo !empty($dr->indenter_draft_saved_at) ? date('d M Y, h:i A', strtotime($dr->indenter_draft_saved_at)) : '—'; ?></td>
+    <td>
+      <a href="<?php echo esc_url(add_query_arg(['mgr_action'=>'create_new','resume_draft'=>$dr->id], get_permalink())); ?>" class="btn btn-draft" style="margin-right:8px;">Continue Draft</a>
+    </td>
+  </tr>
+  <?php endforeach; ?>
+  </tbody>
+</table>
+<?php endif; ?>
+
 <div style="margin-top:10px;">
   <h3 style="margin-top:0;">Recent Submissions</h3>
   <?php if(empty($recent_all)): ?><p style="color:#666;">No submissions yet.</p>
   <?php else: ?>
   <table class="list-table" id="table-mgr-recent" style="margin-top:0;">
-    <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Status</th><th>Date</th><th>Action</th></tr></thead>
+    <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Status</th><th>Submitted Date</th><th>Action</th></tr></thead>
     <tbody>
     <?php foreach($recent_all as $req): $bc='badge-pending';if($req->status==='approved')$bc='badge-approved';if($req->status==='rejected')$bc='badge-rejected';if($req->status==='completed')$bc='badge-completed'; ?>
-    <tr><td><strong><?php echo esc_html($req->test_requisition_no); ?></strong></td><td><?php echo esc_html($req->satellite_name); ?></td><td><?php echo esc_html($req->sub_name ?: '—'); ?></td><td><span class="badge <?php echo $bc; ?>" style="padding:4px 10px;font-size:11px;"><?php echo strtoupper($req->status); ?></span></td><td style="font-size:12px;"><?php echo date('d M Y', strtotime($req->submission_date)); ?></td><td><a href="?view_id=<?php echo $req->id; ?>" class="btn btn-view">VIEW DETAILS</a></td></tr>
+    <tr><td><strong><?php echo esc_html($req->test_requisition_no); ?></strong></td><td><?php echo esc_html($req->satellite_name); ?></td><td><?php echo esc_html($req->sub_name ?: '—'); ?></td><td><span class="badge <?php echo $bc; ?>" style="padding:4px 10px;font-size:11px;"><?php echo strtoupper($req->status); ?></span></td><td style="font-size:12px;"><?php echo date('d M Y, h:i A', strtotime($req->submission_date)); ?></td><td><a href="?view_id=<?php echo $req->id; ?>" class="btn btn-view">VIEW DETAILS</a></td></tr>
     <?php endforeach; ?>
     </tbody>
   </table>
@@ -4974,16 +5711,52 @@ if ($uhv_msg === 'approved'): ?>
     }
 
 // =====================================================================
-//  UHV STAFF VIEW
+//  UHV STAFF VIEW (skip when action=qa_dashboard — that screen is rendered in USER VIEW block above)
 // =====================================================================
-} elseif ($user_role === 'UHV') {
+} elseif ($user_role === 'UHV' && ($_GET['action'] ?? '') !== 'qa_dashboard') {
     $complete_id = intval($_GET['complete_id'] ?? 0);
     $uhv_msg    = sanitize_text_field($_GET['uhv_msg'] ?? '');
+    $uhv_page_action = sanitize_text_field($_GET['action'] ?? '');
+
+    // ── New TR form (same workflow as user submitters) ─────────────────
+    if ($uhv_page_action === 'create_new') {
+        $resume_id = intval($_GET['resume_draft'] ?? 0);
+        if ($resume_id) {
+            $existing_draft = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM {$table} WHERE id=%d AND user_id=%d AND status IN ('draft_indenter','qa_rejected','rejected','recheck_indenter')",
+                $resume_id, $user->ID
+            ));
+        } else {
+            $existing_draft = null;
+        }
+        ?>
+<div class="form-container">
+<div class="role-indicator">UHV STAFF VIEW — NEW REQUEST | <?php echo esc_html($emp->name.' ('.$emp->stno.')'); ?></div>
+<div style="margin-bottom:25px;"><a href="<?php echo esc_url(remove_query_arg(['action', 'resume_draft', 'uhv_msg'], get_permalink())); ?>" class="btn btn-primary">&larr; Back to Staff Dashboard</a></div>
+<h1>New Test Requisition</h1>
+<?php if ($uhv_msg === 'draft_saved'): ?>
+<div class="draft-notice"><strong>&#128203; Draft saved.</strong> You can continue editing below.</div>
+<?php endif; ?>
+<?php
+$_uhv_cn_errs = get_transient('uhv_errors_'.$user->ID);
+if (!empty($_uhv_cn_errs)) {
+    delete_transient('uhv_errors_'.$user->ID);
+    echo "<div style='background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;padding:14px 20px;margin-bottom:20px;border-radius:4px;font-size:15px;'>";
+    echo "<strong>Please fix the following errors:</strong><ul style='margin:8px 0 0 20px;padding:0;'>";
+    foreach ($_uhv_cn_errs as $e) {
+        echo '<li>'.esc_html($e).'</li>';
+    }
+    echo '</ul></div>';
+}
+uhv_request_form($emp, $existing_draft, admin_url('admin-ajax.php'));
+?>
+</div>
+<?php
 
     // ── Individual staff form ─────────────────────────────────────────
-    if ($complete_id) {
+    } elseif ($complete_id) {
         $fd = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$table} WHERE id=%d AND status IN ('approved','completed')", $complete_id
+            "SELECT * FROM {$table} WHERE id=%d AND status IN ('pending_staff','recheck_staff','pending_manager','approved','completed','recheck_indenter')", $complete_id
         ));
         if ($fd):
             $req_full  = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $fd->id));
@@ -4998,15 +5771,24 @@ if ($uhv_msg === 'approved'): ?>
 
 <div style="margin-bottom:20px;display:flex;gap:10px;align-items:center;">
   <a href="<?php echo get_permalink(); ?>" class="btn btn-primary">&larr; Back to Dashboard</a>
+  <?php uhv_print_button($fd->id); ?>
   <?php uhv_history_button($req_full ? $req_full->id : $fd->id); ?>
 </div>
 
 <?php if ($uhv_msg === 'uhv_draft_saved'): ?>
 <div style="background:#d1ecf1;color:#0c5460;border:1px solid #bee5eb;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#10003; <strong>Draft saved successfully.</strong></div>
-<?php elseif (!empty($_uhv_errs)): ?>
-<div style="background:#f8d7da;color:#721c24;border:2px solid #dc3545;padding:16px 20px;margin-bottom:20px;border-radius:4px;">
-  <strong>&#9888; Please fix the following errors:</strong>
-  <ul style="margin:10px 0 0 20px;padding:0;"><?php foreach ($_uhv_errs as $e) echo '<li>'.esc_html($e).'</li>'; ?></ul>
+<?php elseif ($uhv_msg === 'validation_error' || !empty($_uhv_errs)): ?>
+<div style="background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;padding:14px 20px;margin-bottom:25px;border-radius:4px;">
+    <strong>&#9888; Please fix the following errors:</strong>
+    <ul style="margin:10px 0 0 20px; padding:0;">
+        <?php 
+        if (!empty($_uhv_errs)) {
+            foreach ($_uhv_errs as $err) echo '<li>'.esc_html($err).'</li>';
+        } else {
+            echo '<li>All fields in the Staff Review section are mandatory before forwarding to the manager.</li>';
+        }
+        ?>
+    </ul>
 </div>
 <?php endif; ?>
 
@@ -5039,7 +5821,7 @@ if ($uhv_msg === 'approved'): ?>
 <!-- ── Indenter Request Details (read-only) ── -->
 <div class="request-card" style="margin-top:20px;">
   <div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:25px;margin-bottom:0;">
-    <h3 style="margin-top:0;color:#343a40;font-size:18px;">&#128203; INDENTER REQUEST DETAILS <span style="font-size:14px;font-weight:400;color:#6c757d;">(Read-Only)</span></h3>
+    <h3 style="margin-top:0;color:#343a40;font-size:18px;">&#128203; USER REQUEST DETAILS <span style="font-size:14px;font-weight:400;color:#6c757d;">(Read-Only)</span></h3>
     <table style="width:100%;border-collapse:collapse;font-size:17px;">
       <tr>
         <th style="border:1px solid #ccc;padding:10px;background:#e9ecef;width:22%;">Test Object</th>
@@ -5108,138 +5890,304 @@ if ($uhv_msg === 'approved'): ?>
       </tr>
       <?php if (!empty($req_full->manager_comment)): ?>
       <tr>
-        <th style="border:1px solid #ccc;padding:9px;background:#e9ecef;vertical-align:top;">Comments</th>
+        <th style="border:1px solid #ccc;padding:9px;background:#e9ecef;vertical-align:top;">Manager Comments</th>
         <td colspan="3" style="border:1px solid #ccc;padding:9px;"><?php echo nl2br(esc_html($req_full->manager_comment)); ?></td>
       </tr>
       <?php endif; ?>
     </table>
-
-    <h3 style="margin-top:25px;font-size:18px;color:#343a40;">Section A — Pre-Test Assessment <span style="font-size:14px;font-weight:400;color:#6c757d;">(Filled by Manager)</span></h3>
-    <table style="width:100%;border-collapse:collapse;font-size:17px;margin-bottom:22px;background:#fff;border:1px solid #ccc;">
-      <tr>
-        <th style="border:1px solid #ccc;padding:11px;background:#e9ecef;width:42%;text-align:left;">Requisition Received on</th>
-        <td style="border:1px solid #ccc;padding:11px;"><?php echo !empty($req_full->requisition_received_date) ? date('d M Y', strtotime($req_full->requisition_received_date)) : '<em style="color:#aaa;">&mdash;</em>'; ?></td>
-      </tr>
-      <tr>
-        <th style="border:1px solid #ccc;padding:11px;background:#e9ecef;text-align:left;">Risk Assessed?</th>
-        <td style="border:1px solid #ccc;padding:11px;"><?php echo esc_html($req_full->risk_assessed_uhv ?: '&mdash;'); ?></td>
-      </tr>
-      <tr>
-        <th style="border:1px solid #ccc;padding:11px;background:#e9ecef;text-align:left;">Risk Priority Number (RPN)</th>
-        <td style="border:1px solid #ccc;padding:11px;"><?php $rpn_v=$req_full->rpn_uhv??''; echo $rpn_v==='lt4' ? '&lt; 4 (Low Risk)' : ($rpn_v==='gte5' ? '&ge; 5 (High Risk)'.(!empty($req_full->risk_form_file)?' <a href="'.esc_url($req_full->risk_form_file).'" target="_blank" style="font-size:12px;color:#28a745;">&#128206; View File</a>':'') : (esc_html($rpn_v)?:'<em style="color:#aaa;">&mdash;</em>')); ?></td>
-      </tr>
-      <tr>
-        <th style="border:1px solid #ccc;padding:11px;background:#e9ecef;text-align:left;">Risk Assessment Form Filled?</th>
-        <td style="border:1px solid #ccc;padding:11px;"><?php echo esc_html($req_full->risk_form_filled ?: '&mdash;'); ?></td>
-      </tr>
-      <tr>
-        <th style="border:1px solid #ccc;padding:11px;background:#e9ecef;text-align:left;">Any Special Processes?</th>
-        <td style="border:1px solid #ccc;padding:11px;"><?php echo esc_html($req_full->special_processes ?: '&mdash;'); ?></td>
-      </tr>
-      <tr>
-        <th style="border:1px solid #ccc;padding:11px;background:#e9ecef;text-align:left;">Test Received &amp; Reviewed?</th>
-        <td style="border:1px solid #ccc;padding:11px;"><?php echo esc_html($req_full->test_received_reviewed ?: '&mdash;'); ?></td>
-      </tr>
-      <tr>
-        <th style="border:1px solid #ccc;padding:11px;background:#e9ecef;text-align:left;">Test Object Accepted?</th>
-        <td style="border:1px solid #ccc;padding:11px;"><?php echo esc_html($req_full->test_object_accepted ?: '&mdash;'); ?></td>
-      </tr>
-      <tr>
-        <th style="border:1px solid #ccc;padding:11px;background:#e9ecef;text-align:left;">Accepted By (Dy. Manager / Competent Authority)</th>
-        <td style="border:1px solid #ccc;padding:11px;"><?php echo esc_html($req_full->test_accepted_by ?: '&mdash;'); ?></td>
-      </tr>
-    </table>
+    
+    <?php if ($req_full->status === 'approved' || $req_full->status === 'completed'): ?>
+      <div style="margin-top:20px;">
+        <?php uhv_render_per_test_risk_readonly($req_full, 'Section A — Risk Assessment (Filled by Staff)'); ?>
+      </div>
+    <?php endif; ?>
     <?php endif; // reviewed_by ?>
   </div>
 </div>
 <?php endif; // req_full ?>
 
-<!-- ── UHV Fill Form ── -->
-<form method="post" data-form-status="<?php echo esc_attr($fd->status ?? ''); ?>" data-logged-in-name="<?php echo esc_attr($emp->name ?? ''); ?>">
+<!-- ── UHV Fill Form (Phase 1 or 2) ── -->
+<form method="post" enctype="multipart/form-data" data-form-status="<?php echo esc_attr($fd->status ?? ''); ?>" data-logged-in-name="<?php echo esc_attr($emp->name ?? ''); ?>">
 <?php wp_nonce_field('uhv_action','uhv_nonce'); ?>
 <input type="hidden" name="form_id" value="<?php echo $fd->id; ?>">
-<!-- Pass manager-filled Pre-Test Assessment values so complete_uhv validation passes -->
-<input type="hidden" name="requisition_received_date" value="<?php echo esc_attr($fd->requisition_received_date ?? ''); ?>">
-<input type="hidden" name="risk_assessed_uhv" value="<?php echo esc_attr($fd->risk_assessed_uhv ?? ''); ?>">
-<input type="hidden" name="rpn_uhv" value="<?php echo esc_attr($fd->rpn_uhv ?? ''); ?>">
-<input type="hidden" name="risk_form_filled" value="<?php echo esc_attr($fd->risk_form_filled ?? ''); ?>">
-<input type="hidden" name="special_processes" value="<?php echo esc_attr($fd->special_processes ?? ''); ?>">
-<input type="hidden" name="test_received_reviewed" value="<?php echo esc_attr($fd->test_received_reviewed ?? ''); ?>">
-<input type="hidden" name="test_object_accepted" value="<?php echo esc_attr($fd->test_object_accepted ?? ''); ?>">
-<input type="hidden" name="test_accepted_by" value="<?php echo esc_attr($fd->test_accepted_by ?? ''); ?>">
-<input type="hidden" name="risk_record_uhv" value="<?php echo esc_attr($fd->risk_record_uhv ?? ''); ?>">
-<input type="hidden" name="risk_form_file" value="<?php echo esc_attr($fd->risk_form_file ?? ''); ?>">
-<input type="hidden" name="manager_comment" value="<?php echo esc_attr($fd->manager_comment ?? ''); ?>">
-<input type="hidden" name="reviewed_by" value="<?php echo esc_attr($fd->reviewed_by ?? ''); ?>">
 
+<?php 
+    $ro_staff = ($fd->status === 'pending_manager' || $fd->status === 'recheck_indenter') ? 'readonly disabled' : '';
+    if (in_array($fd->status, ['pending_staff','recheck_staff','pending_manager','recheck_indenter'])): 
+?>
+  <!-- ══ PHASE 1: STAFF REVIEW (Image 1) ══ -->
+  <div class="request-card" style="margin-top:20px; border:2px solid #000; padding:30px;">
+    <input type="hidden" name="uhv_staff_form_marker" value="1">
+    
+    <?php 
+    $risk_map = uhv_get_per_test_risk($fd);
+    $labels_ordered = uhv_get_selected_test_labels($fd);
+    foreach ($labels_ordered as $i => $test_name):
+        $risk = $risk_map[$test_name] ?? ['test_object_accepted'=>'','risk_assessed_uhv'=>'','rpn_uhv'=>'','risk_record_uhv'=>'','risk_table_url'=>''];
+    ?>
+    <div style="margin-bottom:40px; border-bottom:2px solid #eee; padding-bottom:25px;">
+      <h3 style="margin:0 0 15px; font-size:18px; color:#0d6efd; font-weight:700;">Test requisitioned: <?php echo esc_html($test_name); ?></h3>
+      <table style="width:100%; border-collapse:collapse; background:#fff; font-size:16px; border:1px solid #000;">
+        <tr>
+          <td style="border:1px solid #000; padding:15px; width:70%; font-weight:500; background:#f9f9f9;">Test request received, reviewed and accepted for testing</td>
+          <td style="border:1px solid #000; padding:15px; width:30%; text-align:center;">
+            <div style="display:flex; justify-content:center; gap:20px;">
+              <label style="font-weight:600; cursor:pointer;"><input type="radio" name="risk_test_object_accepted[<?php echo $i; ?>]" value="yes" <?php checked(strtolower($risk['test_object_accepted'] ?? ''), 'yes'); ?> <?php echo $ro_staff; ?>> Yes</label>
+              <label style="font-weight:600; cursor:pointer;"><input type="radio" name="risk_test_object_accepted[<?php echo $i; ?>]" value="no" <?php checked(strtolower($risk['test_object_accepted'] ?? ''), 'no'); ?> <?php echo $ro_staff; ?>> No</label>
+            </div>
+          </td>
+        </tr>
+        <tr>
+          <td style="border:1px solid #000; padding:15px; width:33%; vertical-align:top;">
+            <div style="margin-bottom:12px; font-weight:600; color:#333;">Risk Assessed as per Online QMS UHV Lab Risk Table:</div>
+            <div style="display:flex; gap:20px;">
+              <label style="font-weight:600; cursor:pointer;"><input type="radio" name="risk_assessed_uhv[<?php echo $i; ?>]" value="yes" <?php checked(strtolower($risk['risk_assessed_uhv'] ?? ''), 'yes'); ?> <?php echo $ro_staff; ?>> Yes</label>
+              <label style="font-weight:600; cursor:pointer;"><input type="radio" name="risk_assessed_uhv[<?php echo $i; ?>]" value="no" <?php checked(strtolower($risk['risk_assessed_uhv'] ?? ''), 'no'); ?> <?php echo $ro_staff; ?>> No</label>
+            </div>
+          </td>
+          <td style="border:1px solid #000; padding:15px; width:33%; vertical-align:top;">
+            <div style="margin-bottom:12px; font-weight:600; color:#333;">Risk Priority No.(RPN):</div>
+            <div style="display:flex; flex-direction:column; gap:8px;">
+              <div style="display:flex; gap:20px; align-items:center;">
+                <label style="font-weight:600; cursor:pointer;">&le; 4 <input type="radio" name="rpn_uhv[<?php echo $i; ?>]" value="lt4" <?php checked($risk['rpn_uhv'] ?? '', 'lt4'); ?> <?php echo $ro_staff; ?> onclick="uhvToggleRiskUpload(<?php echo $i; ?>, 'lt4')"></label>
+                <label style="font-weight:600; cursor:pointer;">&ge; 5 <input type="radio" name="rpn_uhv[<?php echo $i; ?>]" value="gte5" <?php checked($risk['rpn_uhv'] ?? '', 'gte5'); ?> <?php echo $ro_staff; ?> onclick="uhvToggleRiskUpload(<?php echo $i; ?>, 'gte5')"></label>
+              </div>
+              <div id="risk_upload_div_<?php echo $i; ?>" style="display:<?php echo (($risk['rpn_uhv']??'')==='gte5')?'block':'none'; ?>; margin-top:10px; border:1px dashed #0d6efd; padding:8px; border-radius:4px; background:#f0f7ff;">
+                <label style="display:block; font-size:12px; font-weight:600; margin-bottom:4px; color:#0d6efd;">Upload Risk Table (PDF/Image):</label>
+                <input type="file" name="risk_table_file_<?php echo $i; ?>" accept=".pdf,image/*" style="font-size:12px; width:100%;">
+                <?php if (!empty($risk['risk_table_url'])): ?>
+                  <div style="margin-top:5px;"><small>Existing: <a href="<?php echo esc_url($risk['risk_table_url']); ?>" target="_blank">View File</a></small></div>
+                  <input type="hidden" name="existing_risk_table_url[<?php echo $i; ?>]" value="<?php echo esc_attr($risk['risk_table_url']); ?>">
+                <?php endif; ?>
+              </div>
+            </div>
+            <small style="display:block; font-size:11px; color:#666; margin-top:8px;">(as per online QMS Risk Table to be filled if RPN &ge; 5)</small>
+          </td>
+          <td style="border:1px solid #000; padding:15px; width:34%; text-align:center; vertical-align:top;">
+             <div style="margin-bottom:12px; font-weight:600; color:#333;">Risk Record:</div>
+             <div style="display:flex; justify-content:center; gap:15px; font-weight:600;">
+               <label style="cursor:pointer;"><input type="radio" name="risk_record_uhv[<?php echo $i; ?>]" value="yes" <?php checked(strtolower($risk['risk_record_uhv'] ?? ''), 'yes'); ?> <?php echo $ro_staff; ?>> Yes</label>
+               <label style="cursor:pointer;"><input type="radio" name="risk_record_uhv[<?php echo $i; ?>]" value="no" <?php checked(strtolower($risk['risk_record_uhv'] ?? ''), 'no'); ?> <?php echo $ro_staff; ?>> No</label>
+               <label style="cursor:pointer;"><input type="radio" name="risk_record_uhv[<?php echo $i; ?>]" value="na" <?php checked(strtolower($risk['risk_record_uhv'] ?? ''), 'na'); ?> <?php echo $ro_staff; ?>> NA</label>
+             </div>
+          </td>
+        </tr>
+      </table>
+    </div>
+    <?php endforeach; ?>
 
+    <div style="margin-top:20px;">
+      <label style="display:block; margin-bottom:10px; font-weight:700; color:#333; font-size:15px;">Review Remarks / Recheck Instructions <span style="font-weight:400; color:#666; font-size:13px;">(Mandatory for Recheck)</span>:</label>
+      <textarea name="staff_review_comment" placeholder="Enter comments for the manager or instructions for user recheck..." style="width:100%; min-height:100px; border:1px solid #000; border-radius:4px; padding:15px; font-family:inherit; font-size:15px;"></textarea>
+    </div>
 
-<div class="request-card" style="margin-top:20px;">
-  <h3 style="margin-top:0;padding-bottom:12px;border-bottom:2px solid #000;font-size:18px;">Section B — Test Execution Details</h3>
-  <table style="width:100%;border-collapse:collapse;font-size:17px;">
-    <tr>
-      <th style="border:1px solid #000;padding:12px;background:#f5f5f5;width:42%;">Test Started on <span style="color:#dc3545;">*</span></th>
-      <td style="border:1px solid #000;padding:10px;"><input type="datetime-local" class="block" name="test_started_datetime" value="<?php echo esc_attr(str_replace(' ','T',$fd->test_started_datetime ?? '')); ?>"<?php echo $is_done ? ' readonly' : ''; ?>></td>
-    </tr>
-    <tr>
-      <th style="border:1px solid #000;padding:12px;background:#f5f5f5;">Test Completed on <span style="color:#dc3545;">*</span></th>
-      <td style="border:1px solid #000;padding:10px;"><input type="datetime-local" class="block" name="test_completed_datetime" value="<?php echo esc_attr(str_replace(' ','T',$fd->test_completed_datetime ?? '')); ?>"<?php echo $is_done ? ' readonly' : ''; ?>></td>
-    </tr>
-    <tr>
-      <th style="border:1px solid #000;padding:12px;background:#f5f5f5;">Test Duration <small style="font-weight:400;">(auto-calculated)</small></th>
-      <td style="border:1px solid #000;padding:10px;"><input type="text" class="block" name="test_duration" value="<?php echo esc_attr($fd->test_duration ?? ''); ?>" placeholder="HH:MM:SS" readonly style="background:#f5f5f5;cursor:not-allowed;"></td>
-    </tr>
-    <tr>
-      <th style="border:1px solid #000;padding:12px;background:#f5f5f5;">Test Completed On-Time?</th>
-      <td style="border:1px solid #000;padding:10px;">
-<input type="hidden" name="test_on_time" id="testontime_val" value="<?php echo esc_attr(ucfirst(strtolower($fd->test_on_time ?? ''))); ?>">
-        <label class="uniform-check-label"><input type="checkbox" class="uniform-check-input" id="testontime_yes" <?php echo (strtolower($fd->test_on_time??'')=='yes')?'checked':''; ?> <?php echo $is_done?'disabled':''; ?> onchange="uhvToggleCb(this,'testontime_no','testontime_val','Yes')"> Yes</label>
-        <label class="uniform-check-label"><input type="checkbox" class="uniform-check-input" id="testontime_no" <?php echo (strtolower($fd->test_on_time??'')=='no')?'checked':''; ?> <?php echo $is_done?'disabled':''; ?> onchange="uhvToggleCb(this,'testontime_yes','testontime_val','No')"> No</label>
-      </td>
-    </tr>
+    <?php if (!$ro_staff): // Only show review actions if form is editable (not pending_manager/recheck_indenter) ?>
+    <div style="margin-top:40px; border-top:2px solid #eee; padding-top:25px; display:flex; gap:15px; justify-content:flex-end; align-items:center;">
+      <button type="submit" name="save_draft" class="btn btn-draft" style="background:#6c757d; color:#fff; border:none; padding:12px 25px; font-weight:600;">&#128190; SAVE DRAFT</button>
+      <button type="submit" name="staff_review_action" value="recheck_indenter" class="btn btn-reject" style="background:#fd7e14; border:none; padding:12px 25px; font-weight:600; color:#fff;" onclick="return confirm('Send this request back to the user for clarification?');">↩ Send to User for Recheck</button>
+      <button type="submit" name="staff_review_action" value="forward_manager" class="btn btn-approve" style="background:#28a745; border:none; padding:12px 35px; font-weight:700; color:#fff; font-size:16px;">Forward to Manager &rarr;</button>
+    </div>
+    <?php endif; ?>
+    <script>
+    function uhvToggleRiskUpload(idx, val) {
+        const div = document.getElementById('risk_upload_div_' + idx);
+        if (div) {
+            div.style.display = (val === 'gte5') ? 'block' : 'none';
+        }
+    }
+    </script>
+  </div>
 
-    <tr>
-      <th style="border:1px solid #000;padding:12px;background:#f5f5f5;">Test Code</th>
-      <td style="border:1px solid #000;padding:10px;"><input type="text" class="block" name="test_code" value="<?php echo esc_attr($fd->test_code ?? ''); ?>" placeholder="e.g. URSC-TC-001"<?php echo $is_done ? ' readonly' : ''; ?>></td>
-    </tr>
-  </table>
-</div>
-
-<div class="request-card" style="margin-top:20px;">
-  <h3 style="margin-top:0;padding-bottom:12px;border-bottom:2px solid #000;font-size:18px;">Section C — Specimen Collection &amp; Closure</h3>
-  <table style="width:100%;border-collapse:collapse;font-size:17px;">
-    <tr><th colspan="2" style="border:1px solid #000;padding:12px;background:#000;color:#fff;font-weight:600;">Test Specimen Collected By</th></tr>
-    <tr>
-      <th style="border:1px solid #000;padding:12px;background:#f5f5f5;width:42%;">Name <span style="color:#dc3545;">*</span></th>
-      <td style="border:1px solid #000;padding:10px;"><input type="text" class="block" name="specimen_collected_by_name" value="<?php echo esc_attr($fd->specimen_collected_by_name ?? ''); ?>" placeholder="Auto-filled with your name" data-auto-fill="logged-in-name"<?php echo $is_done ? ' readonly' : ''; ?>></td>
-    </tr>
-    <tr>
-      <th style="border:1px solid #000;padding:12px;background:#f5f5f5;">Signature / Initials <span style="color:#dc3545;">*</span></th>
-      <td style="border:1px solid #000;padding:10px;"><input type="text" class="block" name="specimen_collected_by_sig" value="<?php echo esc_attr($fd->specimen_collected_by_sig ?? ''); ?>" placeholder="Auto-filled with name &amp; timestamp" data-auto-fill="signature"<?php echo $is_done ? ' readonly' : ''; ?>></td>
-    </tr>
-    <tr><th colspan="2" style="border:1px solid #000;padding:12px;background:#000;color:#fff;font-weight:600;">Verification &amp; Requisition Closed By <small style="font-weight:400;">(Dy. Manager UHV or Competent Authority)</small></th></tr>
-    <tr>
-      <th style="border:1px solid #000;padding:12px;background:#f5f5f5;">Name <span style="color:#dc3545;">*</span></th>
-      <td style="border:1px solid #000;padding:10px;"><input type="text" class="block" name="verification_closed_by_name" value="<?php echo esc_attr($fd->verification_closed_by_name ?? ''); ?>" placeholder="Auto-filled with your name" data-auto-fill="logged-in-name"<?php echo $is_done ? ' readonly' : ''; ?>></td>
-    </tr>
-    <tr>
-      <th style="border:1px solid #000;padding:12px;background:#f5f5f5;">Signature / Initials <span style="color:#dc3545;">*</span></th>
-      <td style="border:1px solid #000;padding:10px;"><input type="text" class="block" name="verification_closed_by_sig" value="<?php echo esc_attr($fd->verification_closed_by_sig ?? ''); ?>" placeholder="Auto-filled with name &amp; timestamp" data-auto-fill="signature"<?php echo $is_done ? ' readonly' : ''; ?>></td>
-    </tr>
-  </table>
-</div>
-
-<?php if (!$is_done): ?>
-<div style="margin-top:25px;text-align:right;display:flex;justify-content:flex-end;gap:15px;flex-wrap:wrap;">
-  <button type="submit" name="save_draft" class="btn btn-draft">&#128190; SAVE DRAFT</button>
-  <button type="submit" name="complete_uhv" class="btn btn-submit btn-complete-submit" onclick="return confirm('Complete and submit this form? This action cannot be undone.')">&#10003; COMPLETE &amp; SUBMIT</button>
-</div>
 <?php else: ?>
-<div style="margin-top:20px;background:#d4edda;border-left:4px solid #28a745;padding:14px 20px;border-radius:4px;">
-  &#128274; <strong>Form Completed &amp; Locked</strong> — This submission cannot be modified.
-</div>
-<?php endif; ?>
+  <!-- ══ PHASE 2: STAFF EXECUTION (Image 2) ══ -->
+  <div class="request-card" style="margin-top:20px; padding:0; border:none; box-shadow:none;">
+    
+    <!-- Section A Reference -->
+    <!-- Section A Reference -->
+    <?php uhv_render_per_test_risk_readonly($fd, 'Section A — Risk Assessment (Reference)'); ?>
 
+    <?php if (stripos($fd->test_types, 'Bombing') !== false): 
+        $bstaff = json_decode($fd->bombing_staff_json ?? '{}', true);
+        $bcl = $bstaff['checklist'] ?? [];
+        $blu = $bstaff['loading_unloading'] ?? [];
+        $bmsld = $bstaff['msld'] ?? [];
+    ?>
+    <!-- BOMBING EXECUTION DETAILS (MATCHING IMAGE 1 & 2) -->
+    <div style="border:2px solid #000; margin-bottom:30px; background:#fff; border-radius:6px; overflow:hidden;">
+        <div style="background:#000; color:#fff; padding:12px 18px; font-weight:700; font-size:16px;">
+            BOMBING & FINE LEAK DETECTION — EXECUTION DETAILS
+        </div>
+        
+        <div style="padding:20px;">
+            <h4 style="margin-top:0; border-bottom:1px solid #eee; padding-bottom:8px;">1. Check List (Ensure following and tick before test)</h4>
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:25px;">
+                <?php 
+                $cl_items = [
+                    1 => "Check the availability of Helium Gas",
+                    2 => "Ensure ESD safety is provided.",
+                    3 => "Confirm all the timers are connected to UPS Power",
+                    4 => "Check timer is in RESET mode before starting the test.",
+                    5 => "Check chamber lid is properly tighten",
+                    6 => "Ensure chamber is evacuated sufficiently",
+                    7 => "Ensure chamber is Pressurized to required Pressure",
+                    8 => "Ensure timer is set to required dwell time",
+                    9 => "Ensure MSLD is calibrated before use"
+                ];
+                foreach ($cl_items as $idx => $label): ?>
+                <label style="display:flex; align-items:center; gap:10px; font-size:14px; cursor:pointer; background:#f9f9f9; padding:8px; border-radius:4px; border:1px solid #eee;">
+                    <input type="checkbox" name="bombing_checklist[<?php echo $idx; ?>]" value="yes" <?php echo ($bcl[$idx]??'')==='yes'?'checked':''; ?>>
+                    <span><?php echo $idx . '. ' . $label; ?></span>
+                </label>
+                <?php endforeach; ?>
+            </div>
+
+            <h4 style="margin-top:0; border-bottom:1px solid #eee; padding-bottom:8px;">2. Loading & Unloading details for Multi component Bombing station</h4>
+            <div style="overflow-x:auto; margin-bottom:20px;">
+                <table style="width:100%; border-collapse:collapse; background:#fff; font-size:13px;">
+                    <thead>
+                        <tr style="background:#f2f2f2;">
+                            <th style="border:1px solid #000; padding:5px;">Req. Received on</th>
+                            <th style="border:1px solid #000; padding:5px;">Component Name</th>
+                            <th style="border:1px solid #000; padding:5px;">Qty</th>
+                            <th style="border:1px solid #000; padding:5px;">Pressure</th>
+                            <th style="border:1px solid #000; padding:5px;">Chamber utilized</th>
+                            <th style="border:1px solid #000; padding:5px;">Duration</th>
+                            <th style="border:1px solid #000; padding:5px;">Loaded ON</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php for($i=0; $i<4; $i++): $r = $blu[$i] ?? []; ?>
+                        <tr>
+                            <td style="border:1px solid #000; padding:2px;"><input type="text" name="bombing_load_received_on[]" value="<?php echo esc_attr($r['received_on']??''); ?>" style="width:100%; border:none; padding:4px;"></td>
+                            <td style="border:1px solid #000; padding:2px;"><input type="text" name="bombing_load_name[]" value="<?php echo esc_attr($r['name']??''); ?>" style="width:100%; border:none; padding:4px;"></td>
+                            <td style="border:1px solid #000; padding:2px;"><input type="number" name="bombing_load_qty[]" value="<?php echo esc_attr($r['qty']??''); ?>" style="width:100%; border:1px solid #ccc; padding:6px; background:#fff; font-size:14px;"></td>
+                            <td style="border:1px solid #000; padding:2px;"><input type="text" name="bombing_load_pressure[]" value="<?php echo esc_attr($r['pressure']??''); ?>" style="width:100%; border:none; padding:4px;"></td>
+                            <td style="border:1px solid #000; padding:2px;"><input type="text" name="bombing_load_chamber[]" value="<?php echo esc_attr($r['chamber']??''); ?>" style="width:100%; border:none; padding:4px;"></td>
+                            <td style="border:1px solid #000; padding:2px;"><input type="text" name="bombing_load_duration[]" value="<?php echo esc_attr($r['duration']??''); ?>" style="width:100%; border:none; padding:4px;"></td>
+                            <td style="border:1px solid #000; padding:2px;"><input type="text" name="bombing_load_on[]" value="<?php echo esc_attr($r['on']??''); ?>" style="width:100%; border:none; padding:4px;"></td>
+                        </tr>
+                        <?php endfor; ?>
+                    </tbody>
+                </table>
+            </div>
+            
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:20px; margin-bottom:25px;">
+                <div style="border:1px solid #eee; padding:10px; border-radius:4px;">
+                    <label style="font-weight:600; font-size:13px;">Loaded by (Name & Sig):</label>
+                    <input type="text" name="bombing_loaded_by" value="<?php echo esc_attr($bstaff['loaded_by']??''); ?>" style="width:100%; padding:8px; border:1px solid #ccc; margin-top:5px;">
+                </div>
+                <div style="border:1px solid #eee; padding:10px; border-radius:4px;">
+                    <label style="font-weight:600; font-size:13px;">Unloaded by (Name & Sig):</label>
+                    <input type="text" name="bombing_unloaded_by" value="<?php echo esc_attr($bstaff['unloaded_by']??''); ?>" style="width:100%; padding:8px; border:1px solid #ccc; margin-top:5px;">
+                </div>
+            </div>
+
+            <h4 style="margin-top:0; border-bottom:1px solid #eee; padding-bottom:8px;">3. Fine Leak Detection using MSLD</h4>
+            <div style="display:grid; grid-template-columns: 1fr 2fr; gap:20px; margin-bottom:15px;">
+                <div style="background:#f9f9f9; padding:10px; border:1px solid #eee; border-radius:4px;">
+                    <label style="font-weight:600; font-size:13px; display:block; margin-bottom:5px;">MSLD Calibrated:</label>
+                    <label><input type="radio" name="bombing_msld_calibrated" value="yes" <?php echo ($bmsld['calibrated']??'')==='yes'?'checked':''; ?>> Yes</label>
+                    <label style="margin-left:10px;"><input type="radio" name="bombing_msld_calibrated" value="no" <?php echo ($bmsld['calibrated']??'')==='no'?'checked':''; ?>> No</label>
+                </div>
+                <div style="background:#f9f9f9; padding:10px; border:1px solid #eee; border-radius:4px;">
+                    <label style="font-weight:600; font-size:13px; display:block; margin-bottom:5px;">MSLD used:</label>
+                    <?php foreach(['401.1','401.2','401.3','401.4'] as $m): ?>
+                    <label style="margin-right:15px;"><input type="checkbox" name="bombing_msld_used[]" value="<?php echo $m; ?>" <?php echo in_array($m, $bmsld['used']??[])?'checked':''; ?>> <?php echo $m; ?></label>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+            
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:20px; margin-bottom:15px;">
+                <div style="border:1px solid #eee; padding:10px; border-radius:4px;">
+                    <label style="font-weight:600; font-size:13px;">Test Started ON:</label>
+                    <input type="text" name="bombing_msld_started" value="<?php echo esc_attr($bmsld['started']??''); ?>" style="width:100%; padding:8px; border:1px solid #ccc; margin-top:5px;">
+                </div>
+                <div style="border:1px solid #eee; padding:10px; border-radius:4px;">
+                    <label style="font-weight:600; font-size:13px;">Ended ON:</label>
+                    <input type="text" name="bombing_msld_ended" value="<?php echo esc_attr($bmsld['ended']??''); ?>" style="width:100%; padding:8px; border:1px solid #ccc; margin-top:5px;">
+                </div>
+            </div>
+            
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:20px;">
+                <div style="border:1px solid #eee; padding:10px; border-radius:4px;">
+                    <label style="font-weight:600; font-size:13px;">Staff Name:</label>
+                    <input type="text" name="bombing_msld_staff" value="<?php echo esc_attr($bmsld['staff']??''); ?>" style="width:100%; padding:8px; border:1px solid #ccc; margin-top:5px;">
+                </div>
+                <div style="border:1px solid #eee; padding:10px; border-radius:4px;">
+                    <label style="font-weight:600; font-size:13px;">Staff Signature:</label>
+                    <input type="text" name="bombing_msld_sig" value="<?php echo esc_attr($bmsld['sig']??''); ?>" style="width:100%; padding:8px; border:1px solid #ccc; margin-top:5px;">
+                </div>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+
+    <!-- Section B -->
+    <div style="border:1px solid #000; margin-bottom:30px;">
+      <h3 style="margin:0; padding:12px; background:#f8f9fa; border-bottom:1px solid #000; font-size:17px; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;">SECTION B — TEST EXECUTION DETAILS</h3>
+      <table style="width:100%; border-collapse:collapse; font-size:16px;">
+        <tr>
+          <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff; width:45%;">Test Started on <span style="color:#dc3545;">*</span></th>
+          <td style="border:1px solid #000; padding:10px;"><input type="datetime-local" class="block" name="test_started_datetime" value="<?php echo esc_attr(str_replace(' ','T',$fd->test_started_datetime ?? '')); ?>" style="border:1px solid #ccc; padding:8px;"></td>
+        </tr>
+        <tr>
+          <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Test Completed on <span style="color:#dc3545;">*</span></th>
+          <td style="border:1px solid #000; padding:10px;"><input type="datetime-local" class="block" name="test_completed_datetime" value="<?php echo esc_attr(str_replace(' ','T',$fd->test_completed_datetime ?? '')); ?>" style="border:1px solid #ccc; padding:8px;"></td>
+        </tr>
+        <tr>
+          <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Test Duration <small style="font-weight:400; color:#666;">(auto-calculated)</small></th>
+          <td style="border:1px solid #000; padding:10px;"><input type="text" class="block" name="test_duration" value="<?php echo esc_attr($fd->test_duration ?? ''); ?>" placeholder="HH:MM:SS" readonly style="background:#f8f9fa; cursor:not-allowed; border:1px solid #ccc; padding:8px;"></td>
+        </tr>
+        <tr>
+          <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Test Completed On-Time?</th>
+          <td style="border:1px solid #000; padding:10px;">
+            <input type="hidden" name="test_on_time" id="testontime_val" value="<?php echo esc_attr(ucfirst(strtolower($fd->test_on_time ?? ''))); ?>">
+            <div style="display:flex; gap:20px; align-items:center;">
+              <label style="cursor:pointer; display:flex; align-items:center; gap:8px;"><input type="checkbox" id="testontime_yes" <?php echo (strtolower($fd->test_on_time??'')=='yes')?'checked':''; ?> onchange="uhvToggleCb(this,'testontime_no','testontime_val','Yes')"> Yes</label>
+              <label style="cursor:pointer; display:flex; align-items:center; gap:8px;"><input type="checkbox" id="testontime_no" <?php echo (strtolower($fd->test_on_time??'')=='no')?'checked':''; ?> onchange="uhvToggleCb(this,'testontime_yes','testontime_val','No')"> No</label>
+            </div>
+          </td>
+        </tr>
+        <tr>
+          <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Test Code</th>
+          <td style="border:1px solid #000; padding:10px;"><input type="text" class="block" name="test_code" value="<?php echo esc_attr($fd->test_code ?? ''); ?>" placeholder="e.g. URSC-TC-001" style="border:1px solid #ccc; padding:8px;"></td>
+        </tr>
+      </table>
+    </div>
+
+    <!-- Section C -->
+    <div style="border:1px solid #000; margin-bottom:30px;">
+      <h3 style="margin:0; padding:12px; background:#f8f9fa; border-bottom:1px solid #000; font-size:17px; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;">SECTION C — SPECIMEN COLLECTION &amp; CLOSURE</h3>
+      <table style="width:100%; border-collapse:collapse; font-size:16px;">
+        <tr style="background:#000; color:#fff;"><th colspan="2" style="padding:10px; text-align:left; font-weight:600;">Test Specimen Collected By</th></tr>
+        <tr>
+          <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff; width:45%;">Name <span style="color:#dc3545;">*</span></th>
+          <td style="border:1px solid #000; padding:10px;"><input type="text" class="block" name="specimen_collected_by_name" value="<?php echo esc_attr($fd->specimen_collected_by_name ?? ''); ?>" placeholder="Auto-filled with your name" data-auto-fill="logged-in-name" style="border:1px solid #ccc; padding:8px;"></td>
+        </tr>
+        <tr>
+          <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Signature / Initials <span style="color:#dc3545;">*</span></th>
+          <td style="border:1px solid #000; padding:10px;"><input type="text" class="block" name="specimen_collected_by_sig" value="<?php echo esc_attr($fd->specimen_collected_by_sig ?? ''); ?>" placeholder="Auto-filled with name &amp; timestamp" data-auto-fill="signature" style="border:1px solid #ccc; padding:8px;"></td>
+        </tr>
+        <tr style="background:#000; color:#fff;"><th colspan="2" style="padding:10px; text-align:left; font-weight:600;">Verification &amp; Requisition Closed By <small style="font-weight:400;">(Dy. Manager UHV or Competent Authority)</small></th></tr>
+        <tr>
+          <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff; width:45%;">Name <span style="color:#dc3545;">*</span></th>
+          <td style="border:1px solid #000; padding:10px;"><input type="text" class="block" name="verification_closed_by_name" value="<?php echo esc_attr($fd->verification_closed_by_name ?? ''); ?>" placeholder="Auto-filled with your name" data-auto-fill="logged-in-name" style="border:1px solid #ccc; padding:8px;"></td>
+        </tr>
+        <tr>
+          <th style="border:1px solid #000; padding:15px; text-align:left; background:#fff;">Signature / Initials <span style="color:#dc3545;">*</span></th>
+          <td style="border:1px solid #000; padding:10px;"><input type="text" class="block" name="verification_closed_by_sig" value="<?php echo esc_attr($fd->verification_closed_by_sig ?? ''); ?>" placeholder="Auto-filled with name &amp; timestamp" data-auto-fill="signature" style="border:1px solid #ccc; padding:8px;"></td>
+        </tr>
+      </table>
+    </div>
+
+    <?php if (!$is_done): ?>
+    <div style="margin-top:25px; text-align:right; display:flex; justify-content:flex-end; gap:15px;">
+      <button type="submit" name="save_draft" class="btn btn-draft" style="background:#6c757d; color:#fff; border:none; padding:12px 25px; font-weight:600;">&#128190; SAVE DRAFT</button>
+      <button type="submit" name="complete_uhv" class="btn btn-submit" style="background:#198754; color:#fff; border:none; padding:12px 35px; font-weight:700; font-size:16px; box-shadow:0 4px 10px rgba(25,135,84,0.3);" onclick="return confirm('Complete and submit this form? This action cannot be undone.')">&#10003; COMPLETE &amp; SUBMIT</button>
+    </div>
+    <?php endif; ?>
+  </div>
+<?php endif; ?>
 </form>
 </div>
 
@@ -5281,13 +6229,17 @@ document.addEventListener('DOMContentLoaded', function() {
 <?php
         else: echo "<p style='text-align:center;color:#dc3545;padding:50px;'>Form not found or not approved.</p>"; endif;
 
-    // ── Staff Dashboard List ──────────────────────────────────────────────
     } else {
         $all_staff = $wpdb->get_results(
-            "SELECT * FROM {$table} WHERE status IN ('approved','completed') ORDER BY approval_date DESC"
+            "SELECT * FROM {$table} WHERE status IN ('pending_staff','recheck_staff','approved','completed','pending_manager','recheck_indenter','qa_rejected','rejected') ORDER BY submission_date DESC"
         );
-        $cnt_pending_uhv   = count(array_filter((array)$all_staff, fn($r) => $r->status === 'approved'));
-        $cnt_completed_uhv = count(array_filter((array)$all_staff, fn($r) => $r->status === 'completed'));
+        $review_list  = array_filter((array)$all_staff, fn($r) => in_array($r->status, ['pending_staff','recheck_staff']));
+        $active_list  = array_filter((array)$all_staff, fn($r) => in_array($r->status, ['approved','completed','pending_manager']));
+        $sent_back_list = array_filter((array)$all_staff, fn($r) => in_array($r->status, ['recheck_indenter', 'qa_rejected', 'rejected']));
+        
+        $cnt_review    = count($review_list);
+        $cnt_active    = count(array_filter($active_list, fn($r) => $r->status === 'approved'));
+        $cnt_completed = count(array_filter($active_list, fn($r) => $r->status === 'completed'));
 ?>
 <div class="container">
 <div class="role-indicator">UHV STAFF VIEW | <?php echo esc_html($emp->name.' ('.$emp->stno.')'); ?></div>
@@ -5296,52 +6248,119 @@ document.addEventListener('DOMContentLoaded', function() {
 <div style="background:#d1ecf1;color:#0c5460;border:1px solid #bee5eb;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#10003; <strong>Draft saved successfully.</strong></div>
 <?php elseif ($uhv_msg === 'uhv_completed'): ?>
 <div style="background:#d4edda;color:#155724;border:1px solid #c3e6cb;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#10003; <strong>Form completed and submitted successfully.</strong></div>
+<?php elseif ($uhv_msg === 'recheck_sent'): ?>
+<div style="background:#fff3cd;color:#856404;border:1px solid #ffc107;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#8617; <strong>Request sent back to the User for review/editing.</strong> They have been notified.</div>
+<?php elseif ($uhv_msg === 'staff_reviewed'): ?>
+<div style="background:#d4edda;color:#155724;border:1px solid #c3e6cb;padding:14px 20px;margin-bottom:20px;border-radius:4px;">&#10003; <strong>Staff review completed.</strong> Risk assessment has been forwarded to the manager.</div>
 <?php endif; ?>
+
+<?php
+$uhv_staff_qa_pending = (int) $wpdb->get_var($wpdb->prepare(
+    "SELECT COUNT(*) FROM {$table} WHERE qa_stno=%s AND (status='pending_qa' OR (status IN ('pending_manager','pending') AND qa_decision=''))",
+    $emp->stno
+));
+?>
+<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:22px;">
+  <a href="<?php echo esc_url(add_query_arg('action', 'create_new', get_permalink())); ?>" class="btn btn-success" style="padding:12px 22px;">+ NEW TEST REQUEST</a>
+  <a href="<?php echo esc_url(add_query_arg('action', 'qa_dashboard', get_permalink())); ?>" class="btn" style="background:#6f42c1;color:#fff;padding:12px 22px;">
+    &#10003; QA REVIEW <span style="background:<?php echo $uhv_staff_qa_pending > 0 ? '#dc3545' : '#6c757d'; ?>;color:#fff;border-radius:50%;padding:1px 7px;font-size:11px;font-weight:700;margin-left:6px;"><?php echo (int) $uhv_staff_qa_pending; ?></span>
+  </a>
+</div>
 
 <div class="stat-grid" style="margin-bottom:25px;">
-  <div class="stat-card sc-pending"><div class="stat-num"><?php echo $cnt_pending_uhv; ?></div><div class="stat-lbl">Awaiting Completion</div></div>
-  <div class="stat-card sc-approved"><div class="stat-num"><?php echo $cnt_completed_uhv; ?></div><div class="stat-lbl">Completed</div></div>
-  <div class="stat-card" style="border-color:#000;background:#f8f8f8;color:#000;"><div class="stat-num"><?php echo count((array)$all_staff); ?></div><div class="stat-lbl">Total Assigned</div></div>
+  <a href="<?php echo esc_url(add_query_arg('action', 'view_staff', get_permalink())); ?>" class="stat-card" style="border-color:#0d6efd;color:#0d6efd;text-decoration:none;"><div class="stat-num"><?php echo $cnt_review; ?></div><div class="stat-lbl">Awaiting Review</div></a>
+  <a href="<?php echo esc_url(add_query_arg('action', 'view_staff', get_permalink())); ?>" class="stat-card sc-pending" style="text-decoration:none;"><div class="stat-num"><?php echo $cnt_active; ?></div><div class="stat-lbl">Awaiting Completion</div></a>
+  <a href="<?php echo esc_url(add_query_arg('action', 'view_staff', get_permalink())); ?>" class="stat-card sc-approved" style="text-decoration:none;"><div class="stat-num"><?php echo $cnt_completed; ?></div><div class="stat-lbl">Completed</div></a>
 </div>
 
-<h3 style="margin-top:0;">All Approved &amp; Completed Test Requests</h3>
-<p style="color:#555;font-size:14px;margin-bottom:22px;">Click <strong>Fill / View</strong> to open the UHV completion form for any request.</p>
-
-<?php if (empty($all_staff)): ?>
-<div style="text-align:center;padding:70px;color:#666;border:2px solid #ddd;background:#f9f9f9;border-radius:8px;">
-  <h3 style="margin:0 0 10px;font-size:18px;color:#333;">NO APPROVED REQUESTS YET</h3>
-  <p style="margin:0;font-size:15px;">Once a manager approves a test request it will appear here.</p>
-</div>
+<!-- ══ LIST 1: AWAITING REVIEW ══ -->
+<h3 style="margin-top:0;color:#0d6efd;">Awaiting Review (Phase 1)</h3>
+<?php if (empty($review_list)): ?>
+  <div style="padding:20px;background:#f9f9f9;border:1px solid #ddd;color:#666;margin-bottom:30px;">No requests awaiting review.</div>
 <?php else: ?>
-<table class="list-table">
-  <thead>
-    <tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Approved On</th><th>Staff Form Status</th><th>Action</th></tr>
-  </thead>
-  <tbody>
-  <?php foreach ($all_staff as $_sf):
-    if ($_sf->status === 'completed') {
-        $sf_badge = '<span class="badge badge-completed" style="font-size:11px;padding:4px 10px;">&#10003; COMPLETED</span>';
-        $sf_btn = 'View (Completed)'; $sf_style = 'background:#555;';
-    } elseif (!empty($_sf->draft_saved_at)) {
-        $sf_badge = '<span class="badge badge-pending" style="font-size:11px;padding:4px 10px;">&#128203; Draft Saved</span>';
-        $sf_btn = 'Continue Draft'; $sf_style = '';
-    } else {
-        $sf_badge = '<span class="badge badge-approved" style="font-size:11px;padding:4px 10px;">&#9203; Not Started</span>';
-        $sf_btn = 'Fill Staff Form'; $sf_style = '';
-    }
-  ?>
-  <tr>
-    <td><strong><?php echo esc_html($_sf->test_requisition_no); ?></strong></td>
-    <td><?php echo esc_html($_sf->satellite_name); ?></td>
-    <td><?php echo esc_html($_sf->sub_name ?: '—'); ?></td>
-    <td style="font-size:12px;"><?php echo !empty($_sf->approval_date) ? date('d M Y', strtotime($_sf->approval_date)) : '—'; ?></td>
-    <td><?php echo $sf_badge; ?></td>
-    <td><a href="<?php echo esc_url(add_query_arg('complete_id', $_sf->id, get_permalink())); ?>" class="btn btn-view" style="<?php echo $sf_style; ?>"><?php echo $sf_btn; ?></a></td>
-  </tr>
-  <?php endforeach; ?>
-  </tbody>
-</table>
+  <table class="list-table" id="table-staff-review">
+    <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Submitted Date</th><th>Status</th><th>Action</th></tr></thead>
+    <tbody>
+    <?php foreach ($review_list as $_sf): ?>
+      <tr>
+        <td><strong><?php echo esc_html($_sf->test_requisition_no); ?></strong></td>
+        <td><?php echo esc_html($_sf->satellite_name); ?></td>
+        <td><?php echo esc_html($_sf->sub_name ?: '—'); ?></td>
+        <td><?php echo !empty($_sf->submission_date) ? date('d M Y, h:i A', strtotime($_sf->submission_date)) : '—'; ?></td>
+        <td><span class="badge" style="background:<?php echo ($_sf->status==='recheck_staff')?'#fd7e14':'#0d6efd'; ?>;color:#fff;"><?php echo ($_sf->status==='recheck_staff')?'RECHECK':'AWAITING REVIEW'; ?></span></td>
+        <td><a href="<?php echo esc_url(add_query_arg('complete_id', $_sf->id, get_permalink())); ?>" class="btn btn-view" style="background:#0d6efd;">Open Staff Review</a></td>
+      </tr>
+    <?php endforeach; ?>
+    </tbody>
+  </table>
 <?php endif; ?>
+
+<!-- ══ LIST 2: ACTIVE / COMPLETED ══ -->
+<h3 style="margin-top:40px;">Active Testing & Completed (Phase 2)</h3>
+<?php if (empty($active_list)): ?>
+  <div style="padding:20px;background:#f9f9f9;border:1px solid #ddd;color:#666;">No active or completed tests.</div>
+<?php else: ?>
+  <table class="list-table" id="table-staff-active">
+    <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Submitted Date</th><th>Status</th><th>Action</th></tr></thead>
+    <tbody>
+    <?php foreach ($active_list as $_sf): 
+        $bc = 'badge-pending'; $lbl = 'Awaiting Completion'; $btn = 'Fill Staff Form'; $bs = '';
+        if ($_sf->status === 'completed') { $bc = 'badge-completed'; $lbl = 'COMPLETED'; $btn = 'View Details'; $bs = 'background:#555;'; }
+        elseif ($_sf->status === 'pending_manager') { $bc = 'badge-pending-qa'; $lbl = 'Pending Mgr Approval'; $btn = 'View Status'; $bs = 'background:#6c757d;'; }
+        elseif (!empty($_sf->draft_saved_at)) { $bc = 'badge-pending'; $lbl = 'Draft Saved'; $btn = 'Continue Draft'; }
+    ?>
+      <tr>
+        <td><strong><?php echo esc_html($_sf->test_requisition_no); ?></strong></td>
+        <td><?php echo esc_html($_sf->satellite_name); ?></td>
+        <td><?php echo esc_html($_sf->sub_name ?: '—'); ?></td>
+        <td><?php echo !empty($_sf->submission_date) ? date('d M Y, h:i A', strtotime($_sf->submission_date)) : '—'; ?></td>
+        <td><span class="badge <?php echo $bc; ?>"><?php echo $lbl; ?></span></td>
+        <td><a href="<?php echo esc_url(add_query_arg('complete_id', $_sf->id, get_permalink())); ?>" class="btn btn-view" style="<?php echo $bs; ?>"><?php echo $btn; ?></a></td>
+      </tr>
+    <?php endforeach; ?>
+    </tbody>
+  </table>
+<?php endif; ?>
+
+<!-- ══ LIST 3: SENT BACK / REJECTED (with user) ══ -->
+<h3 style="margin-top:40px;color:#fd7e14;font-weight:700;">SENT BACK / REJECTED (AWAITING USER ACTION)</h3>
+<?php if (empty($sent_back_list)): ?>
+  <div style="padding:20px;background:#f9f9f9;border:1px solid #ddd;color:#666;">No requests are currently with the user for correction or follow-up.</div>
+<?php else: ?>
+  <table class="list-table" id="table-staff-sentback">
+    <thead><tr><th>TR No.</th><th>Test Object</th><th>Submitted By</th><th>Submitted Date</th><th>Status</th><th>Action</th></tr></thead>
+    <tbody>
+    <?php foreach ($sent_back_list as $_sf):
+        if ($_sf->status === 'recheck_indenter') {
+            $sb_bc = 'badge-qa-rejected';
+            $sb_lbl = 'SENT BACK';
+            $sb_href = esc_url(add_query_arg('complete_id', $_sf->id, get_permalink()));
+            $sb_target = '';
+        } elseif ($_sf->status === 'qa_rejected') {
+            $sb_bc = 'badge-qa-rejected';
+            $sb_lbl = 'QA REJECTED';
+            $sb_href = esc_url(get_template_directory_uri() . '/uhv-pdf-generator.php?request_id=' . (int) $_sf->id);
+            $sb_target = ' target="_blank" rel="noopener"';
+        } else {
+            $sb_bc = 'badge-rejected';
+            $sb_lbl = 'REJECTED';
+            $sb_href = esc_url(get_template_directory_uri() . '/uhv-pdf-generator.php?request_id=' . (int) $_sf->id);
+            $sb_target = ' target="_blank" rel="noopener"';
+        }
+    ?>
+      <tr>
+        <td><strong><?php echo esc_html($_sf->test_requisition_no); ?></strong></td>
+        <td><?php echo esc_html($_sf->satellite_name); ?></td>
+        <td><?php echo esc_html($_sf->sub_name ?: '—'); ?></td>
+        <td><?php echo !empty($_sf->submission_date) ? date('d M Y, h:i A', strtotime($_sf->submission_date)) : '—'; ?></td>
+        <td><span class="badge <?php echo esc_attr($sb_bc); ?>"><?php echo esc_html($sb_lbl); ?></span></td>
+        <td><a href="<?php echo $sb_href; ?>" class="btn btn-view" style="background:#fd7e14;"<?php echo $sb_target; ?>>VIEW DETAILS</a></td>
+      </tr>
+    <?php endforeach; ?>
+    </tbody>
+  </table>
+<?php endif; ?>
+</div>
 </div>
 <?php
     } // end else (dashboard)
@@ -5436,6 +6455,7 @@ table.dataTable thead .sorting_desc::after { content: "↓"; opacity: 1; color: 
 .list-table th:hover {
     background: #222 !important;
 }
+
 </style>
 
 <script>
@@ -5486,4 +6506,15 @@ function uhvToggleMultiCb(el, otherIds, hiddenId, val) {
 }
 </script>
 <?php uhv_history_modal_html(); ?>
-<?php get_footer(); ?>
+<?php
+
+function uhv_print_button($id) {
+    if (!$id) return;
+    ?>
+    <a href="<?php echo get_template_directory_uri(); ?>/uhv-pdf-generator.php?request_id=<?php echo $id; ?>" target="_blank" class="btn btn-primary" style="background:#000; color:#fff; display:inline-flex; align-items:center; gap:8px;">
+        <span style="font-size:16px;">&#128424;</span> Print Document (PDF)
+    </a>
+    <?php
+}
+?>
+ <?php get_footer(); ?>
