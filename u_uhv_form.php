@@ -1995,6 +1995,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['action_type'])) {
 
     $form_id    = intval($_POST['form_id']);
     $action_raw = sanitize_text_field($_POST['action_type'] ?? '');
+    $form       = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $form_id));
+    if (!$form) {
+        wp_redirect(add_query_arg('uhv_msg', 'invalid_form', remove_query_arg(['view_id'], get_permalink())));
+        exit;
+    }
 
     // ── STEP 1: Manager Decision (approve/reject/recheck) ──
     // This fires when the decision buttons are clicked (before env form is shown)
@@ -5602,7 +5607,7 @@ if ($uhv_msg_v === 'decision_saved'): ?>
   <div style="background:#fffcf0;border:1px solid #ffcc00;border-radius:6px;padding:25px;margin:20px 0;">
     <h3 style="margin-top:0;color:#cd7e00;font-size:16px;">&#9878; MANAGER DECISION</h3>
     <p style="color:#555;font-size:14px;margin:0 0 18px 0;">Review the indenter's request above. Enter your remarks and choose an action. A comment is <strong>mandatory</strong> for Reject and Send for Review.</p>
-    <form method="post" enctype="multipart/form-data">
+    <form method="post" enctype="multipart/form-data" novalidate>
       <?php wp_nonce_field('uhv_action','uhv_nonce'); ?>
       <input type="hidden" name="form_id" value="<?php echo $req->id; ?>">
 
@@ -5690,16 +5695,19 @@ if ($uhv_msg_v === 'decision_saved'): ?>
       
       <div style="margin-top:18px;display:flex;gap:12px;flex-wrap:wrap;align-items:center;">
         <button type="submit" name="action_type" value="approve"
+                formnovalidate
                 style="padding:10px 24px;background:#28a745;color:#fff;border:none;cursor:pointer;font-weight:700;font-size:16px;border-radius:4px;letter-spacing:.5px;"
                 onclick="return uhvConfirmApprove(this)">
           &#10003; APPROVE
         </button>
         <button type="submit" name="action_type" value="reject"
+                formnovalidate
                 style="padding:10px 24px;background:#dc3545;color:#fff;border:none;cursor:pointer;font-weight:700;font-size:16px;border-radius:4px;letter-spacing:.5px;"
                 onclick="return validateMgrComment(this)">
           &#10007; REJECT
         </button>
         <button type="submit" name="action_type" value="recheck"
+                formnovalidate
                 style="padding:10px 24px;background:#fd7e14;color:#fff;border:none;cursor:pointer;font-weight:700;font-size:16px;border-radius:4px;letter-spacing:.5px;"
                 onclick="return validateMgrComment(this)">
           &#8617; SEND FOR REVIEW (Return to Indenter)
